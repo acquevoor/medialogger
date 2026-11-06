@@ -1,0 +1,321 @@
+"""Catalog search and username pulls. Workers call these, so nothing here touches Qt or the database.
+
+Hard rule: no request ever goes to a rateyourmusic.com page or a Letterboxd HTML page. Both answer 403 and RYM's
+robots.txt disallows everything, so they only appear as links for your browser. Letterboxd's public RSS is the one
+exception. Backloggd and RanobeDB have no pull: robots.txt and a login stand in the way.
+"""
+import json
+import re
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+
+from .store import COVER_HOSTS, cover_ok, make_key, norm
+
+UA = "medialogger/0.1 ( https://github.com/acquevoor )"  # MusicBrainz requires a descriptive agent
+MAX_COVER = 8 << 20
+SLOW = threading.Lock()  # MusicBrainz asks for 1 req/s and Wikidata for serial requests
+_last = 0.0
+
+
+def fetch(url, data=None, headers=None, sleep=time.sleep):
+    """-> bytes. A 429 waits for Retry-After (at most 60 s) and tries once more."""
+    req = urllib.request.Request(url, data=data, headers={"User-Agent": UA, **(headers or {})})
+    for attempt in (1, 2):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.read()
+        except urllib.error.HTTPError as e:
+            if e.code != 429 or attempt == 2:
+                raise
+            ra = str(e.headers.get("Retry-After") or "")
+            sleep(min(int(ra) if ra.isdigit() else 10, 60))
+
+
+def slow_fetch(url, headers=None):
+    global _last
+    with SLOW:
+        time.sleep(max(0, _last + 1 - time.monotonic()))
+        try:
+            return fetch(url, headers=headers)
+        finally:
+            _last = time.monotonic()
+
+
+def _json(label, body_fn):
+    """Run a request; failures become RuntimeError("<label>: …") with the site's own message when it sends one."""
+    try:
+        return json.loads(body_fn())
+    except urllib.error.HTTPError as e:
+        raw = e.read()[:2000]
+        try:
+            doc = json.loads(raw)
+            msg = doc["errors"][0]["message"] if "errors" in doc else doc.get("message", "")
+        except (ValueError, KeyError, IndexError, TypeError, AttributeError):
+            msg = raw.decode(errors="replace")[:120]
+        raise RuntimeError(f"{label}: {msg or f'HTTP {e.code}'}") from None
+    except (urllib.error.URLError, TimeoutError, ValueError) as e:
+        raise RuntimeError(f"{label}: {e}") from None
+
+
+def _post(label, url, doc):
+    return _json(label, lambda: fetch(url, json.dumps(doc).encode(), {"Content-Type": "application/json"}))
+
+
+def _year(s):
+    m = re.match(r"\d{4}", str(s or ""))
+    return int(m[0]) if m and 1000 <= int(m[0]) <= 3000 else None
+
+
+def _link(fmt, title):
+    return fmt.format(urllib.parse.quote(title, safe=""))
+
+
+BACKLOGGD_SEARCH = "https://backloggd.com/search/games/{}/"
+LETTERBOXD_SEARCH = "https://letterboxd.com/search/films/{}/"
+RYM_SEARCH = "https://rateyourmusic.com/search?searchterm={}&searchtype=l"
+
+
+def rym_link(artist, title):
+    return _link(RYM_SEARCH, f"{artist} {title}".strip())
+
+
+# ---------- AniList ----------
+
+ANILIST = "https://graphql.anilist.co"
+MEDIA = "id siteUrl title{romaji english} startDate{year} coverImage{medium}"
+SEARCH_Q = "query($s:String,$t:MediaType){Page(perPage:20){media(search:$s,type:$t){%s studios(isMain:true){nodes{name}} staff(perPage:1){nodes{name{full}}}}}}" % MEDIA
+LIST_Q = ("query($u:String,$t:MediaType){MediaListCollection(userName:$u,type:$t){lists{entries{status progress notes"
+          " score(format:POINT_10_DECIMAL) startedAt{year month day} completedAt{year month day} media{%s}}}}}") % MEDIA
+ANILIST_STATUS = {"CURRENT": "active", "REPEATING": "active", "PLANNING": "planned", "COMPLETED": "done", "PAUSED": "paused", "DROPPED": "dropped"}
+
+
+def _anilist_row(kind, m):
+    return {"kind": kind, "site": "anilist", "key": str(m["id"]), "title": m["title"]["english"] or m["title"]["romaji"],
+            "year": (m.get("startDate") or {}).get("year"), "url": m.get("siteUrl") or "", "cover": (m.get("coverImage") or {}).get("medium") or ""}
+
+
+def anilist_search(kind, q):
+    doc = _post("AniList", ANILIST, {"query": SEARCH_Q, "variables": {"s": q, "t": kind.upper()}})
+    out = []
+    for m in doc["data"]["Page"]["media"]:
+        names = [n["name"] for n in m["studios"]["nodes"]] if kind == "anime" else [n["name"]["full"] for n in m["staff"]["nodes"]]
+        out.append({**_anilist_row(kind, m), "creator": ", ".join(names[:2])})
+    return out
+
+
+def _fuzzy(d):
+    d = d or {}
+    return f"{d['year']:04}-{d['month']:02}-{d['day']:02}" if d.get("year") and d.get("month") and d.get("day") else ""
+
+
+def anilist_pull(user):
+    out = []
+    for kind in ("anime", "manga"):
+        doc = _post("AniList", ANILIST, {"query": LIST_Q, "variables": {"u": user, "t": kind.upper()}})
+        for lst in doc["data"]["MediaListCollection"]["lists"]:
+            for e in lst["entries"]:
+                out.append({**_anilist_row(kind, e["media"]), "status": ANILIST_STATUS.get(e["status"], "planned"), "rating": e["score"] or None,
+                            "progress": e["progress"] or None, "started": _fuzzy(e["startedAt"]), "finished": _fuzzy(e["completedAt"]), "notes": e["notes"] or ""})
+    return out
+
+
+# ---------- VNDB ----------
+
+VNDB = "https://api.vndb.org/kana"
+VN_FIELDS = "title,image.url,released,developers.name"
+VNDB_LABELS = (("Playing", "active"), ("Finished", "done"), ("Stalled", "paused"), ("Dropped", "dropped"), ("Wishlist", "planned"))
+
+
+def _vn_row(vid, vn):
+    return {"kind": "vn", "site": "vndb", "key": vid, "title": vn["title"], "creator": ", ".join(d["name"] for d in vn.get("developers", [])[:2]),
+            "year": _year(vn.get("released")), "url": f"https://vndb.org/{vid}", "cover": (vn.get("image") or {}).get("url") or ""}
+
+
+def vndb_search(q):
+    doc = _post("VNDB", f"{VNDB}/vn", {"filters": ["search", "=", q], "fields": VN_FIELDS, "results": 20})
+    return [_vn_row(v["id"], v) for v in doc["results"]]
+
+
+def vndb_status(labels, vote):
+    """-> status, or None for a blacklisted VN, which isn't a log entry."""
+    if "Blacklist" in labels:
+        return None
+    return next((s for name, s in VNDB_LABELS if name in labels), "done" if vote else "planned")
+
+
+def vndb_pull(user):
+    url = f"{VNDB}/user?" + urllib.parse.urlencode({"q": user})
+    found = _json("VNDB", lambda: fetch(url)).get(user)
+    if not found:
+        raise RuntimeError(f"VNDB: no user named {user}")
+    out, page = [], 1
+    while True:
+        doc = _post("VNDB", f"{VNDB}/ulist", {"user": found["id"], "results": 100, "page": page,
+                                              "fields": "vote,started,finished,notes,labels.label," + ",".join(f"vn.{f}" for f in VN_FIELDS.split(","))})
+        for e in doc["results"]:
+            status = vndb_status({x["label"] for x in e["labels"]}, e["vote"])
+            if status:
+                out.append({**_vn_row(e["id"], e["vn"]), "status": status, "rating": e["vote"] / 10 if e["vote"] else None,
+                            "started": e["started"] or "", "finished": e["finished"] or "", "notes": e["notes"] or ""})
+        if not doc["more"]:
+            return out
+        page += 1
+
+
+# ---------- Wikidata (films, console-only games) ----------
+
+SPARQL = """SELECT ?f ?fLabel ?slug ?date ?img WHERE {
+  SERVICE wikibase:mwapi { bd:serviceParam wikibase:api "EntitySearch"; wikibase:endpoint "www.wikidata.org";
+    mwapi:search %s; mwapi:language "en"; wikibase:limit 30 . ?f wikibase:apiOutputItem mwapi:item. }
+  ?f %s. OPTIONAL { ?f wdt:P6127 ?slug } OPTIONAL { ?f wdt:P577 ?date } OPTIONAL { ?f wdt:P18 ?img }
+  SERVICE wikibase:label { bd:serviceParam wikibase:language "en,mul". } }"""  # en,mul: Hades has no plain en label
+
+
+def wikidata(q, cls):
+    """-> [{id, title, year, slug, img}], earliest year first per item: an item has one row per release date."""
+    url = "https://query.wikidata.org/sparql?" + urllib.parse.urlencode({"query": SPARQL % (json.dumps(q), cls)})
+    doc = _json("Wikidata", lambda: slow_fetch(url, {"Accept": "application/sparql-results+json"}))
+    items = {}
+    for b in doc["results"]["bindings"]:
+        v = {k: x["value"] for k, x in b.items()}
+        qid, title = v["f"].rsplit("/", 1)[1], v.get("fLabel", "")
+        if re.fullmatch(r"Q\d+", title or "Q0"):
+            continue  # the label service falls back to the raw id
+        year = _year(v.get("date"))
+        it = items.setdefault(qid, {"id": qid, "title": title, "year": year, "slug": "", "img": ""})
+        it["year"] = min(filter(None, (it["year"], year)), default=None)
+        it["slug"] = it["slug"] or v.get("slug", "")
+        it["img"] = it["img"] or v.get("img", "")
+    return list(items.values())
+
+
+def _commons(img):
+    # P18 values are http Special:FilePath links
+    return img.replace("http://", "https://", 1) + "?width=300" if img else ""
+
+
+def film_search(q):
+    out = []
+    for it in wikidata(q, "wdt:P31/wdt:P279* wd:Q11424"):
+        url = f"https://letterboxd.com/film/{urllib.parse.quote(it['slug'])}/" if it["slug"] else _link(LETTERBOXD_SEARCH, it["title"])
+        out.append({"kind": "film", "site": "letterboxd", "key": make_key("film", it["title"], it["year"]), "title": it["title"],
+                    "year": it["year"], "url": url, "cover": _commons(it["img"])})
+    return out
+
+
+# ---------- games ----------
+
+def game_search(q):
+    """Steam for covers, Wikidata for what Steam doesn't sell. Keys are per-source ids, so remakes sharing a title both fit.
+    Links go to a Backloggd search: its slugs aren't derivable (Wikidata's IGDB slug for Hades is hades--1).
+    ponytail: the same game can appear under Steam and Wikidata with different spellings."""
+    url = "https://store.steampowered.com/api/storesearch/?" + urllib.parse.urlencode({"term": q, "cc": "us", "l": "en"})
+    out = [{"kind": "game", "site": "backloggd", "key": f"steam:{g['id']}", "title": g["name"], "url": _link(BACKLOGGD_SEARCH, g["name"]),
+            "cover": g.get("tiny_image") or ""} for g in _json("Steam", lambda: fetch(url))["items"] if g.get("type") == "app"]
+    seen = {norm(g["title"]) for g in out}
+    try:
+        extra = wikidata(q, "wdt:P31 wd:Q7889")
+    except RuntimeError:
+        if not out:
+            raise
+        extra = []  # Wikidata's endpoint is often busy; Steam's hits still stand
+    for it in extra:
+        if norm(it["title"]) not in seen:
+            out.append({"kind": "game", "site": "backloggd", "key": f"wikidata:{it['id']}", "title": it["title"], "year": it["year"],
+                        "url": _link(BACKLOGGD_SEARCH, it["title"]), "cover": _commons(it["img"])})
+    return out
+
+
+# ---------- music ----------
+
+def music_search(q):
+    term = re.sub(r'([+\-&|!(){}\[\]^"~*?:\\/])', r"\\\1", q)  # Lucene syntax
+    url = "https://musicbrainz.org/ws/2/release-group?" + urllib.parse.urlencode({"query": term, "fmt": "json", "limit": 25})
+    out = []
+    for g in _json("MusicBrainz", lambda: slow_fetch(url))["release-groups"]:
+        artist = "".join(a["name"] + a.get("joinphrase", "") for a in g.get("artist-credit", []))
+        year = _year(g.get("first-release-date"))
+        out.append({"kind": "music", "site": "rym", "key": make_key("music", g["title"], creator=artist), "title": g["title"], "creator": artist,
+                    "year": year, "url": rym_link(artist, g["title"]), "cover": f"https://coverartarchive.org/release-group/{g['id']}/front-250"})
+    return out
+
+
+# ---------- RanobeDB ----------
+
+def novel_search(q):
+    url = "https://ranobedb.org/api/v0/series?" + urllib.parse.urlencode({"q": q, "limit": 20})
+    out = []
+    for s in _json("RanobeDB", lambda: fetch(url))["series"]:
+        name = (((s.get("book") or {}).get("image") or {}).get("filename")) or ""
+        out.append({"kind": "novel", "site": "ranobedb", "key": str(s["id"]), "title": s.get("title") or s.get("romaji_orig") or s["title_orig"],
+                    "year": _year(s.get("c_start_date")), "url": f"https://ranobedb.org/series/{s['id']}",
+                    "cover": f"https://images.ranobedb.org/{name}" if name else ""})
+    return out
+
+
+def search(kind, q):
+    """-> rows ready for the Log dialog: kind, site, key, title and whatever else the site knows."""
+    if kind in ("anime", "manga"):
+        return anilist_search(kind, q)
+    return {"game": game_search, "music": music_search, "film": film_search, "novel": novel_search, "vn": vndb_search}[kind](q)
+
+
+# ---------- Letterboxd RSS ----------
+
+LB = "{https://letterboxd.com}"
+
+
+def parse_rss(xml):
+    """Diary rows from a Letterboxd feed; list posts in the feed have no filmTitle and are skipped."""
+    out = []
+    for item in ET.fromstring(xml).iter("item"):
+        title = item.findtext(LB + "filmTitle")
+        if not title:
+            continue
+        year = _year(item.findtext(LB + "filmYear"))
+        rating = item.findtext(LB + "memberRating")
+        film = re.search(r"/film/([^/]+)", item.findtext("link") or "")
+        poster = re.search(r'<img src="([^"]+)"', item.findtext("description") or "")
+        out.append({"kind": "film", "site": "letterboxd", "key": make_key("film", title, year), "title": title, "year": year, "status": "done",
+                    "url": f"https://letterboxd.com/film/{film[1]}/" if film else "", "cover": poster[1] if poster else "",
+                    "rating": float(rating) * 2 if rating else None, "finished": item.findtext(LB + "watchedDate") or ""})
+    return out
+
+
+def letterboxd_pull(user):
+    if not re.fullmatch(r"\w+", user):
+        raise RuntimeError("Letterboxd: usernames are letters, digits and underscores")
+    try:
+        return parse_rss(fetch(f"https://letterboxd.com/{user}/rss/"))
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"Letterboxd: HTTP {e.code} for {user}") from None
+    except (urllib.error.URLError, TimeoutError, ET.ParseError) as e:
+        raise RuntimeError(f"Letterboxd: {e}") from None
+
+
+PULLS = {"anilist": anilist_pull, "vndb": vndb_pull, "letterboxd": letterboxd_pull}
+
+
+# ---------- covers ----------
+
+class _CheckedRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not cover_ok(newurl):  # coverartarchive.org and Commons redirect; the target must be on the list too
+            raise urllib.error.URLError(f"cover redirected off the allowed hosts: {newurl[:80]}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def fetch_cover(url):
+    """-> image bytes, only from COVER_HOSTS."""
+    if not cover_ok(url):
+        raise ValueError(f"cover host not allowed, only {', '.join(COVER_HOSTS)}")
+    opener = urllib.request.build_opener(_CheckedRedirect)
+    with opener.open(urllib.request.Request(url, headers={"User-Agent": UA}), timeout=30) as r:
+        data = r.read(MAX_COVER + 1)
+    if len(data) > MAX_COVER:
+        raise ValueError("cover is too large")
+    return data
