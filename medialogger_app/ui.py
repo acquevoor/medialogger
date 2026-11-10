@@ -9,11 +9,11 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QDesktopServices, QKeySequence, QPixmap, QShortcut
+from PySide6.QtCore import QObject, QRect, QSize, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QFontMetrics, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout,
                                QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
-                               QPlainTextEdit, QPushButton, QSpinBox, QSplitter, QTableWidget, QTableWidgetItem, QTabWidget, QToolBar, QVBoxLayout, QWidget)
+                               QPlainTextEdit, QPushButton, QSpinBox, QSplitter, QStyle, QStyledItemDelegate, QTableWidget, QTableWidgetItem, QTabWidget, QToolBar, QVBoxLayout, QWidget)
 
 from . import imports, sources, store
 
@@ -137,30 +137,111 @@ class LogDialog(QDialog):
         self.accept()
 
 
+TILE_W, TILE_H = 150, 225  # 2:3, the shape of a poster or box
+COVER_ROLE, LINES_ROLE = Qt.UserRole + 1, Qt.UserRole + 2
+
+
+class Tile(QStyledItemDelegate):
+    """One search result: the cover (or a "no cover" card) and a caption that always has room for what tells same-titled
+    things apart: the title on up to two lines, then year · creator, then the detail (platforms, format, release type)."""
+    PAD, CAPTION = 8, 74
+
+    def sizeHint(self, option, index):
+        return QSize(TILE_W + 2 * self.PAD, TILE_H + self.CAPTION + 2 * self.PAD)
+
+    def paint(self, p, option, index):
+        p.save()
+        r, pal = option.rect.adjusted(2, 2, -2, -2), option.palette
+        if option.state & QStyle.State_Selected:
+            p.fillRect(r, pal.highlight())
+        fg = pal.highlightedText().color() if option.state & QStyle.State_Selected else pal.text().color()
+        box = QRect(r.left() + (r.width() - TILE_W) // 2, r.top() + self.PAD, TILE_W, TILE_H)
+        pix = index.data(COVER_ROLE)
+        if pix:
+            p.drawPixmap(box.left() + (TILE_W - pix.width()) // 2, box.top() + (TILE_H - pix.height()) // 2, pix)
+        else:
+            p.fillRect(box, pal.alternateBase())
+            p.setPen(pal.placeholderText().color())
+            p.drawText(box, Qt.AlignCenter, "no cover" if index.data(Qt.UserRole) == "none" else "…")
+        title, meta, detail = index.data(LINES_ROLE)
+        y, w = box.bottom() + 6, r.width() - 2 * self.PAD
+        bold = QFont(option.font)
+        bold.setBold(True)
+        fm = QFontMetrics(bold)
+        p.setFont(bold)
+        p.setPen(fg)
+        two = fm.elidedText(title, Qt.ElideRight, w * 2 - fm.averageCharWidth() * 3)  # wraps onto two lines at most
+        p.drawText(QRect(r.left() + self.PAD, y, w, fm.height() * 2), Qt.AlignHCenter | Qt.AlignTop | Qt.TextWordWrap, two)
+        y += fm.height() * 2
+        fm = QFontMetrics(option.font)
+        p.setFont(option.font)
+        for line, dim in ((meta, False), (detail, True)):
+            if dim:
+                c = QColor(fg)
+                c.setAlphaF(0.65)
+                p.setPen(c)
+            p.drawText(QRect(r.left() + self.PAD, y, w, fm.height()), Qt.AlignHCenter, fm.elidedText(line, Qt.ElideRight, w))
+            y += fm.height()
+        p.restore()
+
+
 class ResultsDialog(QDialog):
+    """Search results as a cover grid, like imagesearcher's: the cover, year, creator and the detail line (platforms,
+    format, release type) are what tell same-titled things apart."""
+
     def __init__(self, parent, db, kind, rows):
         super().__init__(parent)
         self.setWindowTitle(f"{store.KINDS[kind]}: {len(rows)} found")
-        self.resize(640, 460)
-        self.rows, self.chosen = rows, None
+        self.resize(1040, 760)
+        self.rows, self.chosen, self.alive = rows, None, True
         box = QVBoxLayout(self)
-        self.list = QListWidget()
+        self.grid = QListWidget()
+        self.grid.setViewMode(QListWidget.IconMode)
+        self.grid.setResizeMode(QListWidget.Adjust)
+        self.grid.setMovement(QListWidget.Static)
+        self.grid.setUniformItemSizes(True)
+        self.grid.setSpacing(4)
+        self.grid.setItemDelegate(Tile(self.grid))
         for r in rows:
-            mark = " ✓ logged" if store.find(db, r["site"], r["key"]) else ""
-            text = f"{r['title']}" + (f" ({r['year']})" if r.get("year") else "") + (f" — {r['creator']}" if r.get("creator") else "") + mark
-            self.list.addItem(QListWidgetItem(text))
-        self.list.itemActivated.connect(self.pick)
-        self.list.itemDoubleClicked.connect(self.pick)
-        box.addWidget(self.list)
+            logged = store.find(db, r["site"], r["key"])
+            title = ("✓ " if logged else "") + r["title"]
+            meta = " · ".join(str(x) for x in (r.get("year"), r.get("creator")) if x)
+            item = QListWidgetItem()
+            item.setData(LINES_ROLE, (title, meta, r.get("detail", "")))
+            item.setData(Qt.UserRole, "wait" if r.get("cover") else "none")
+            item.setToolTip("\n".join(x for x in (r["title"], meta, r.get("detail", "")) if x) + ("\n\nAlready in your log" if logged else ""))
+            self.grid.addItem(item)
+            if r.get("cover"):
+                url = r["cover"]
+                run(lambda url=url: load_cover(url), lambda path, err, item=item: self.got_cover(item, path, err))
+        self.grid.itemActivated.connect(self.pick)
+        box.addWidget(self.grid)
+        hint = QLabel("Double-click a cover to log it.", textFormat=Qt.PlainText)
         buttons = QDialogButtonBox(QDialogButtonBox.Cancel)
         buttons.addButton("Log selected", QDialogButtonBox.AcceptRole).clicked.connect(self.pick)
         buttons.addButton("Enter by hand…", QDialogButtonBox.ActionRole).clicked.connect(self.manual)
         buttons.rejected.connect(self.reject)
-        box.addWidget(buttons)
-        self.list.setCurrentRow(0)
+        row = QHBoxLayout()
+        row.addWidget(hint, 1)
+        row.addWidget(buttons)
+        box.addLayout(row)
+        self.grid.setCurrentRow(0)
+
+    def got_cover(self, item, path, err):
+        if not self.alive:  # covers keep arriving after the dialog closes
+            return
+        pix = None if err else QPixmap(str(path))
+        if pix and not pix.isNull():
+            item.setData(COVER_ROLE, pix.scaled(TILE_W, TILE_H, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        else:
+            item.setData(Qt.UserRole, "none")  # a 404 or an unreadable file: say so instead of loading forever
+
+    def done(self, code):
+        self.alive = False
+        super().done(code)
 
     def pick(self, *_):
-        i = self.list.currentRow()
+        i = self.grid.currentRow()
         if i >= 0:
             self.chosen = self.rows[i]
             self.accept()
@@ -401,7 +482,9 @@ class Tab(QWidget):
             show_error(self, "Search failed", err)
             return
         dlg = ResultsDialog(self, self.main.db, self.kind, rows)
-        if dlg.exec() and dlg.chosen is not None:
+        picked = dlg.exec() and dlg.chosen is not None
+        dlg.deleteLater()
+        if picked:
             r = dlg.chosen
             old = store.find(self.main.db, r["site"], r["key"]) if r else None
             self.log_row(old or {**r, "kind": self.kind})

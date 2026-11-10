@@ -12,6 +12,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 
 from .store import COVER_HOSTS, cover_ok, make_key, norm
 
@@ -86,7 +87,7 @@ def rym_link(artist, title):
 # ---------- AniList ----------
 
 ANILIST = "https://graphql.anilist.co"
-MEDIA = "id siteUrl title{romaji english} startDate{year} coverImage{medium}"
+MEDIA = "id siteUrl format episodes chapters title{romaji english} startDate{year} coverImage{large}"
 SEARCH_Q = "query($s:String,$t:MediaType){Page(perPage:20){media(search:$s,type:$t){%s studios(isMain:true){nodes{name}} staff(perPage:1){nodes{name{full}}}}}}" % MEDIA
 LIST_Q = ("query($u:String,$t:MediaType){MediaListCollection(userName:$u,type:$t){lists{entries{status progress notes"
           " score(format:POINT_10_DECIMAL) startedAt{year month day} completedAt{year month day} media{%s}}}}}") % MEDIA
@@ -95,7 +96,14 @@ ANILIST_STATUS = {"CURRENT": "active", "REPEATING": "active", "PLANNING": "plann
 
 def _anilist_row(kind, m):
     return {"kind": kind, "site": "anilist", "key": str(m["id"]), "title": m["title"]["english"] or m["title"]["romaji"],
-            "year": (m.get("startDate") or {}).get("year"), "url": m.get("siteUrl") or "", "cover": (m.get("coverImage") or {}).get("medium") or ""}
+            "year": (m.get("startDate") or {}).get("year"), "url": m.get("siteUrl") or "", "cover": (m.get("coverImage") or {}).get("large") or ""}
+
+
+def _anilist_detail(m):
+    """TV · 26 eps, Movie, Manga · 380 ch: what tells a show from its film or spin-off."""
+    fmt = {"TV": "TV", "TV_SHORT": "TV short", "MOVIE": "Movie", "OVA": "OVA", "ONA": "ONA", "ONE_SHOT": "One-shot"}.get(m.get("format"), (m.get("format") or "").title())
+    n = f"{m['episodes']} eps" if m.get("episodes") else f"{m['chapters']} ch" if m.get("chapters") else ""
+    return " · ".join(x for x in (fmt, n) if x)
 
 
 def anilist_search(kind, q):
@@ -103,7 +111,7 @@ def anilist_search(kind, q):
     out = []
     for m in doc["data"]["Page"]["media"]:
         names = [n["name"] for n in m["studios"]["nodes"]] if kind == "anime" else [n["name"]["full"] for n in m["staff"]["nodes"]]
-        out.append({**_anilist_row(kind, m), "creator": ", ".join(names[:2])})
+        out.append({**_anilist_row(kind, m), "creator": ", ".join(names[:2]), "detail": _anilist_detail(m)})
     return out
 
 
@@ -166,31 +174,57 @@ def vndb_pull(user):
         page += 1
 
 
-# ---------- Wikidata (films, console-only games) ----------
+# ---------- Wikidata (films, games) ----------
 
-SPARQL = """SELECT ?f ?fLabel ?slug ?date ?img WHERE {
+# One row per item, in the search's own relevance order (apiOrdinal), with what tells same-titled things apart:
+# year, creator (director / developer) and platforms. en,mul labels: Hades has no plain en one.
+SPARQL = """SELECT ?f ?ord (SAMPLE(?lab) AS ?title) (MIN(?date) AS ?d) (SAMPLE(?slug) AS ?lb) (SAMPLE(?steam) AS ?st) (SAMPLE(?wp) AS ?wpt)
+  (SAMPLE(?img) AS ?pic) (GROUP_CONCAT(DISTINCT ?byL; separator=", ") AS ?by) (GROUP_CONCAT(DISTINCT ?platL; separator=", ") AS ?plats) WHERE {
   SERVICE wikibase:mwapi { bd:serviceParam wikibase:api "EntitySearch"; wikibase:endpoint "www.wikidata.org";
-    mwapi:search %s; mwapi:language "en"; wikibase:limit 30 . ?f wikibase:apiOutputItem mwapi:item. }
-  ?f %s. OPTIONAL { ?f wdt:P6127 ?slug } OPTIONAL { ?f wdt:P577 ?date } OPTIONAL { ?f wdt:P18 ?img }
-  SERVICE wikibase:label { bd:serviceParam wikibase:language "en,mul". } }"""  # en,mul: Hades has no plain en label
+    mwapi:search %s; mwapi:language "en"; wikibase:limit 30 . ?f wikibase:apiOutputItem mwapi:item. ?ord wikibase:apiOrdinal true. }
+  ?f %s.
+  OPTIONAL { ?f rdfs:label ?lab FILTER(LANG(?lab) IN ("en", "mul")) }
+  OPTIONAL { ?f wdt:P577 ?date } OPTIONAL { ?f wdt:P6127 ?slug } OPTIONAL { ?f wdt:P1733 ?steam } OPTIONAL { ?f wdt:P18 ?img }
+  OPTIONAL { ?wpa schema:about ?f; schema:isPartOf <https://en.wikipedia.org/>; schema:name ?wp }
+  OPTIONAL { ?f wdt:%s ?b. ?b rdfs:label ?byL FILTER(LANG(?byL) = "en") }
+  OPTIONAL { ?f wdt:P400 ?p. ?p rdfs:label ?platL FILTER(LANG(?platL) = "en") }
+} GROUP BY ?f ?ord ORDER BY ?ord"""
 
 
-def wikidata(q, cls):
-    """-> [{id, title, year, slug, img}], earliest year first per item: an item has one row per release date."""
-    url = "https://query.wikidata.org/sparql?" + urllib.parse.urlencode({"query": SPARQL % (json.dumps(q), cls)})
+def wikidata(q, cls, by):
+    """-> [{id, title, year, slug, steam, wp, img, creator, platforms}] in relevance order. by: P57 director, P178 developer."""
+    url = "https://query.wikidata.org/sparql?" + urllib.parse.urlencode({"query": SPARQL % (json.dumps(q), cls, by)})
     doc = _json("Wikidata", lambda: slow_fetch(url, {"Accept": "application/sparql-results+json"}))
-    items = {}
+    out = []
     for b in doc["results"]["bindings"]:
         v = {k: x["value"] for k, x in b.items()}
-        qid, title = v["f"].rsplit("/", 1)[1], v.get("fLabel", "")
-        if re.fullmatch(r"Q\d+", title or "Q0"):
-            continue  # the label service falls back to the raw id
-        year = _year(v.get("date"))
-        it = items.setdefault(qid, {"id": qid, "title": title, "year": year, "slug": "", "img": ""})
-        it["year"] = min(filter(None, (it["year"], year)), default=None)
-        it["slug"] = it["slug"] or v.get("slug", "")
-        it["img"] = it["img"] or v.get("img", "")
-    return list(items.values())
+        if not v.get("title"):
+            continue  # no English or multilingual name
+        out.append({"id": v["f"].rsplit("/", 1)[1], "title": v["title"], "year": _year(v.get("d")), "slug": v.get("lb", ""), "steam": v.get("st", ""),
+                    "wp": v.get("wpt", ""), "img": v.get("pic", ""), "creator": v.get("by", ""), "platforms": v.get("plats", "")})
+    return out
+
+
+def wiki_covers(titles):
+    """English Wikipedia article -> its lead image (posters, box art), for up to 50 titles in one request.
+    pilicense=any: covers are non-free images, which the API leaves out by default."""
+    titles = list(dict.fromkeys(t for t in titles if t))[:50]
+    if not titles:
+        return {}
+    url = "https://en.wikipedia.org/w/api.php?" + urllib.parse.urlencode({"action": "query", "prop": "pageimages", "piprop": "thumbnail", "pithumbsize": 300,
+                                                                        "pilicense": "any", "redirects": 1, "format": "json", "formatversion": 2, "titles": "|".join(titles)})
+    try:
+        doc = _json("Wikipedia", lambda: fetch(url)).get("query", {})
+    except RuntimeError:
+        return {}  # pictures only: a search shouldn't fail over them
+    hop = {x["from"]: x["to"] for x in doc.get("normalized", []) + doc.get("redirects", [])}
+    found = {p["title"]: p["thumbnail"]["source"] for p in doc.get("pages", []) if p.get("thumbnail")}
+    out = {}
+    for t in titles:
+        final = hop.get(hop.get(t, t), hop.get(t, t))
+        if final in found:
+            out[t] = found[final]
+    return out
 
 
 def _commons(img):
@@ -198,35 +232,75 @@ def _commons(img):
     return img.replace("http://", "https://", 1) + "?width=300" if img else ""
 
 
+SHORT_PLATFORMS = {"Microsoft Windows": "Windows", "Xbox Series X and Series S": "Xbox Series", "Nintendo Switch": "Switch", "Nintendo Switch 2": "Switch 2",
+                   "Nintendo GameCube": "GameCube", "Nintendo 3DS": "3DS", "Nintendo DS": "DS", "PlayStation Portable": "PSP", "PlayStation Vita": "Vita"}
+
+
+def _platforms(text, shown=3):
+    names = [SHORT_PLATFORMS.get(p, p) for p in text.split(", ") if p]
+    return ", ".join(names[:shown]) + (f" +{len(names) - shown}" if len(names) > shown else "")
+
+
 def film_search(q):
+    items = wikidata(q, "wdt:P31/wdt:P279* wd:Q11424", "P57")
+    covers = wiki_covers(it["wp"] for it in items)
     out = []
-    for it in wikidata(q, "wdt:P31/wdt:P279* wd:Q11424"):
+    for it in items:
         url = f"https://letterboxd.com/film/{urllib.parse.quote(it['slug'])}/" if it["slug"] else _link(LETTERBOXD_SEARCH, it["title"])
-        out.append({"kind": "film", "site": "letterboxd", "key": make_key("film", it["title"], it["year"]), "title": it["title"],
-                    "year": it["year"], "url": url, "cover": _commons(it["img"])})
+        out.append({"kind": "film", "site": "letterboxd", "key": make_key("film", it["title"], it["year"]), "title": it["title"], "year": it["year"],
+                    "creator": it["creator"], "url": url, "cover": covers.get(it["wp"]) or _commons(it["img"])})
     return out
 
 
 # ---------- games ----------
 
+STEAM_COVER = "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/{}/library_600x900.jpg"  # portrait; the bigger games have one
+
+
+def steam_games(q):
+    """Steam's store search, games only (category 998): no DLC, soundtracks or demos. -> [(appid, name, image)]
+    The image is the wide capsule on the app's own path: newer apps keep their art under a hash, so header.jpg 404s."""
+    url = "https://store.steampowered.com/search/results/?" + urllib.parse.urlencode({"term": q, "category1": 998, "json": 1, "count": 12})
+    out = []
+    for g in _json("Steam", lambda: fetch(url)).get("items", []):
+        m = re.search(r"/apps/(\d+)/", g.get("logo", ""))
+        if m:
+            out.append((m[1], g["name"], g["logo"].replace("capsule_sm_120", "capsule_231x87")))
+    return out
+
+
 def game_search(q):
-    """Steam for covers, Wikidata for what Steam doesn't sell. Keys are per-source ids, so remakes sharing a title both fit.
-    Links go to a Backloggd search: its slugs aren't derivable (Wikidata's IGDB slug for Hades is hades--1).
-    ponytail: the same game can appear under Steam and Wikidata with different spellings."""
-    url = "https://store.steampowered.com/api/storesearch/?" + urllib.parse.urlencode({"term": q, "cc": "us", "l": "en"})
-    out = [{"kind": "game", "site": "backloggd", "key": f"steam:{g['id']}", "title": g["name"], "url": _link(BACKLOGGD_SEARCH, g["name"]),
-            "cover": g.get("tiny_image") or ""} for g in _json("Steam", lambda: fetch(url))["items"] if g.get("type") == "app"]
-    seen = {norm(g["title"]) for g in out}
-    try:
-        extra = wikidata(q, "wdt:P31 wd:Q7889")
-    except RuntimeError:
-        if not out:
-            raise
-        extra = []  # Wikidata's endpoint is often busy; Steam's hits still stand
-    for it in extra:
-        if norm(it["title"]) not in seen:
-            out.append({"kind": "game", "site": "backloggd", "key": f"wikidata:{it['id']}", "title": it["title"], "year": it["year"],
-                        "url": _link(BACKLOGGD_SEARCH, it["title"]), "cover": _commons(it["img"])})
+    """Wikidata first: it knows the year, platforms and developer that tell same-titled games apart (Resident Evil 4 from
+    2005 and 2023). Steam fills in what Wikidata lacks, mostly small PC games. A Steam id is the key whenever there is
+    one, so the same game is the same entry whichever list it came from. Links go to a Backloggd search: its slugs
+    aren't derivable (Wikidata's IGDB slug for Hades is hades--1)."""
+    with ThreadPoolExecutor(1) as side:  # both at once: Wikidata alone takes a couple of seconds
+        steam_job = side.submit(steam_games, q)
+        try:
+            items, wd_err = wikidata(q, "wdt:P31 wd:Q7889", "P178"), None
+        except RuntimeError as e:
+            items, wd_err = [], e  # Wikidata's endpoint is often busy; Steam's hits still stand
+        try:
+            steam = steam_job.result()
+        except RuntimeError:
+            steam = []
+    if wd_err and not steam:
+        raise wd_err
+    covers = wiki_covers(it["wp"] for it in items if not it["steam"])
+    out, seen = [], set()
+    for it in items:
+        key = f"steam:{it['steam']}" if it["steam"] else f"wikidata:{it['id']}"
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"kind": "game", "site": "backloggd", "key": key, "title": it["title"], "year": it["year"], "creator": it["creator"],
+                    "detail": _platforms(it["platforms"]), "url": _link(BACKLOGGD_SEARCH, it["title"]),
+                    "cover": STEAM_COVER.format(it["steam"]) if it["steam"] else covers.get(it["wp"]) or _commons(it["img"])})
+    for appid, name, image in steam:
+        if f"steam:{appid}" not in seen:
+            seen.add(f"steam:{appid}")
+            out.append({"kind": "game", "site": "backloggd", "key": f"steam:{appid}", "title": name, "detail": "Steam",
+                        "url": _link(BACKLOGGD_SEARCH, name), "cover": image})
     return out
 
 
@@ -239,8 +313,9 @@ def music_search(q):
     for g in _json("MusicBrainz", lambda: slow_fetch(url))["release-groups"]:
         artist = "".join(a["name"] + a.get("joinphrase", "") for a in g.get("artist-credit", []))
         year = _year(g.get("first-release-date"))
+        kinds = " · ".join(filter(None, [g.get("primary-type"), *g.get("secondary-types", [])]))  # Album · Live, Single, EP
         out.append({"kind": "music", "site": "rym", "key": make_key("music", g["title"], creator=artist), "title": g["title"], "creator": artist,
-                    "year": year, "url": rym_link(artist, g["title"]), "cover": f"https://coverartarchive.org/release-group/{g['id']}/front-250"})
+                    "year": year, "detail": kinds, "url": rym_link(artist, g["title"]), "cover": f"https://coverartarchive.org/release-group/{g['id']}/front-250"})
     return out
 
 

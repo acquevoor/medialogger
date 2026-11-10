@@ -118,12 +118,13 @@ def test_mapping():
 
 
 def stub(replies):
-    """fetch answering in order; bodies are JSON-encoded unless already bytes."""
+    """fetch answering in order, or by URL when given {url part: reply} (game search asks two sites at once);
+    bodies are JSON-encoded unless already bytes."""
     calls = []
 
     def fake(url, data=None, headers=None, **kw):
         calls.append((url, data))
-        r = replies.pop(0)
+        r = next(v for k, v in replies.items() if k in url) if isinstance(replies, dict) else replies.pop(0)
         return r if isinstance(r, bytes) else json.dumps(r).encode()
     src.fetch = src.slow_fetch = fake
     return calls
@@ -133,9 +134,10 @@ def test_sources():
     real = src.fetch, src.slow_fetch
     try:
         stub([{"data": {"Page": {"media": [{"id": 154587, "siteUrl": "https://anilist.co/anime/154587", "title": {"romaji": "Sousou no Frieren", "english": "Frieren: Beyond Journey's End"},
-                                            "startDate": {"year": 2023}, "coverImage": {"medium": "https://s4.anilist.co/x.jpg"}, "studios": {"nodes": [{"name": "MADHOUSE"}]}, "staff": {"nodes": []}}]}}}])
+                                            "startDate": {"year": 2023}, "coverImage": {"large": "https://s4.anilist.co/x.jpg"}, "format": "TV", "episodes": 28, "studios": {"nodes": [{"name": "MADHOUSE"}]}, "staff": {"nodes": []}}]}}}])
         r = src.search("anime", "frieren")[0]
         assert r["key"] == "154587" and r["creator"] == "MADHOUSE" and r["year"] == 2023 and r["title"].startswith("Frieren")
+        assert r["detail"] == "TV · 28 eps" and r["cover"] == "https://s4.anilist.co/x.jpg"
 
         media = {"id": 5, "siteUrl": "https://anilist.co/anime/5", "title": {"romaji": "R", "english": None}, "startDate": {"year": None}, "coverImage": {"medium": ""}}
         stub([{"data": {"MediaListCollection": {"lists": [{"entries": [{"status": "REPEATING", "progress": 3, "notes": None, "score": 0, "startedAt": {"year": 2020, "month": 1, "day": 2},
@@ -170,19 +172,58 @@ def test_sources():
         assert r["creator"] == "Radiohead" and r["key"] == "radiohead|ok computer" and r["url"].startswith("https://rateyourmusic.com/search")
         assert st.cover_ok(r["cover"])
 
-        def bind(f, label, date=None, slug=None):
-            b = {"f": {"value": f"http://www.wikidata.org/entity/{f}"}, "fLabel": {"value": label}}
-            b |= {"date": {"value": date}} if date else {}
-            return b | ({"slug": {"value": slug}} if slug else {})
-        calls = stub([{"results": {"bindings": [bind("Q1", "Dune", "2021-10-22T00:00:00Z", "dune-2021"), bind("Q1", "Dune", "2021-09-03T00:00:00Z"), bind("Q2", "Q2")]}}])
+        def bind(f, ord_, title=None, **v):
+            """One grouped Wikidata row: d date, lb Letterboxd slug, st Steam id, wpt Wikipedia title, by creator, plats."""
+            b = {"f": {"value": f"http://www.wikidata.org/entity/{f}"}, "ord": {"value": str(ord_)}}
+            return b | ({"title": {"value": title}} if title else {}) | {k: {"value": x} for k, x in v.items()}
+        wiki = {"query": {"normalized": [{"from": "dune (2021 film)", "to": "Dune (2021 film)"}], "redirects": [{"from": "Dune (2021 film)", "to": "Dune (film)"}],
+                          "pages": [{"title": "Dune (film)", "thumbnail": {"source": "https://upload.wikimedia.org/dune.jpg"}}]}}
+        calls = stub({"query.wikidata.org": {"results": {"bindings": [
+                          bind("Q1", 0, "Dune", d="2021-09-03T00:00:00Z", lb="dune-2021", wpt="dune (2021 film)", by="Denis Villeneuve"),
+                          bind("Q2", 1)]}},  # no English or multilingual name: dropped
+                      "wikipedia.org": wiki})
         r = src.search("film", 'du"ne')
         assert len(r) == 1 and r[0]["year"] == 2021 and r[0]["url"] == "https://letterboxd.com/film/dune-2021/" and r[0]["key"] == "dune|2021"
+        assert r[0]["cover"] == "https://upload.wikimedia.org/dune.jpg" and r[0]["creator"] == "Denis Villeneuve"
         assert '\\"' in calls[0][0] or "%5C%22" in calls[0][0]  # the search term can't break out of the SPARQL string
+        assert "pilicense=any" in calls[1][0]
 
-        stub([{"items": [{"type": "app", "id": 1145360, "name": "Hades", "tiny_image": "https://shared.akamai.steamstatic.com/x.jpg"}]},
-              {"results": {"bindings": [bind("Q59756366", "Hades", "2020-09-17T00:00:00Z"), bind("Q2147673", "Hades Nebula", "1987-01-01T00:00:00Z")]}}])
-        r = src.search("game", "hades")
-        assert [g["key"] for g in r] == ["steam:1145360", "wikidata:Q2147673"] and "backloggd.com/search/games/Hades" in r[0]["url"]
+        # same title, told apart by year, platforms and Steam id; a Steam hit Wikidata also has appears once
+        stub({"store.steampowered.com": {"items": [{"name": "Resident Evil 4", "logo": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/2050650/capsule_sm_120.jpg"},
+                                                   {"name": "Indie Thing", "logo": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/42/capsule_sm_120.jpg"}]},
+              "query.wikidata.org": {"results": {"bindings": [
+                  bind("Q1", 0, "Resident Evil 4", d="2005-01-11T00:00:00Z", st="254700", by="Capcom", plats="Nintendo GameCube, Microsoft Windows, Wii, PlayStation 2, Zeebo"),
+                  bind("Q2", 1, "Resident Evil 4", d="2023-03-24T00:00:00Z", st="2050650", by="Capcom"),
+                  bind("Q3", 2, "Resident Evil 4: Wii Edition", d="2007-05-31T00:00:00Z", wpt="RE4 Wii")]}},
+              "wikipedia.org": {"query": {"pages": [{"title": "RE4 Wii", "thumbnail": {"source": "https://upload.wikimedia.org/wii.jpg"}}]}}})
+        r = src.search("game", "resident evil 4")
+        assert [g["key"] for g in r] == ["steam:254700", "steam:2050650", "wikidata:Q3", "steam:42"], [g["key"] for g in r]
+        assert [g["year"] for g in r[:3]] == [2005, 2023, 2007] and r[0]["detail"] == "GameCube, Windows, Wii +2"
+        assert r[0]["cover"].endswith("/254700/library_600x900.jpg") and r[2]["cover"] == "https://upload.wikimedia.org/wii.jpg" and r[3]["detail"] == "Steam"
+        assert r[3]["cover"].endswith("/apps/42/capsule_231x87.jpg")
+        assert all(st.cover_ok(g["cover"]) for g in r) and "backloggd.com/search/games/Resident" in r[0]["url"]
+
+        # Wikidata down: Steam's hits still come back; both down: an error
+        def wd_down(url, data=None, headers=None, **kw):
+            if "wikidata" in url:
+                raise urllib.error.URLError("busy")
+            return json.dumps({"items": [{"name": "Hades", "logo": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/1145360/c.jpg"}]}).encode()
+        src.fetch = src.slow_fetch = wd_down
+        assert [g["key"] for g in src.search("game", "hades")] == ["steam:1145360"]
+
+        def all_down(url, data=None, headers=None, **kw):
+            raise urllib.error.URLError("offline")
+        src.fetch = src.slow_fetch = all_down
+        try:
+            src.search("game", "hades")
+            raise AssertionError("no error with every source down")
+        except RuntimeError as e:
+            assert "Wikidata" in str(e)
+        assert src.wiki_covers(["x"]) == {}  # pictures never fail a search
+
+        stub([{"release-groups": [{"id": "abc", "title": "Live in Rainbows", "first-release-date": "2008", "primary-type": "Album", "secondary-types": ["Live"],
+                                   "artist-credit": [{"name": "Radiohead"}]}]}])
+        assert src.search("music", "in rainbows")[0]["detail"] == "Album · Live"
     finally:
         src.fetch, src.slow_fetch = real
 
