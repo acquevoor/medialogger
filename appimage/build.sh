@@ -34,8 +34,10 @@ PY="$APPDIR/usr/python/bin/python3"
 # nothing of the host's desktop theme may load: the app brings its own look (medialogger_app/look.py)
 SITE=$("$PY" -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")
 rm -f "$SITE"/PySide6/Qt/plugins/platformthemes/libqgtk3.so
-# what the app never loads: QML, 3D, and the dev tools and headers
+# what the app never loads: QML, 3D, PDF images, and the dev tools and headers. The PDF image plugin needs
+# libQt6Pdf, which only the full PySide6 carries
 rm -rf "$SITE"/PySide6/{include,typesystems,glue,scripts,examples,doc,assistant,designer,linguist,lupdate,lrelease,uic,rcc} \
+       "$SITE"/PySide6/Qt/qml "$SITE"/PySide6/Qt/plugins/imageformats/libqpdf.so \
        "$SITE"/PySide6/Qt/plugins/{designer,qmltooling,sqldrivers,sceneparsers,assetimporters,geometryloaders,renderers,renderplugins,canbus,sensors,texttospeech,position,scxmldatamodel}
 find "$APPDIR/usr/python" -name "__pycache__" -prune -exec rm -rf {} +
 cp -r medialogger.py medialogger_app README.md "$APPDIR/usr/app/"
