@@ -2,6 +2,30 @@
 
 A local log for games, anime, manga, music, films, light novels and visual novels. Your log lives on your machine; nothing is ever written back to a site, and no tokens are needed.
 
+PySide6 + Python stdlib.
+
+## Which way to run it
+| You're on | Do this |
+|---|---|
+| **Linux** (including Bazzite, SteamOS, Fedora Atomic) | Download the **AppImage** from Releases: nothing to install. See [Linux AppImage](#linux-appimage-no-install). |
+| **Windows** | Install Python, then double-click `medialogger.py`. See [Windows](#windows-no-terminal-needed). |
+| **NixOS / Nix** | `nix run github:acquevoor/medialogger` |
+| **Linux with Python, from source** | `python3 medialogger.py` in this folder. It installs PySide6 with pip on first run. |
+
+`medialogger.py` is the only file you start. The files in `appimage/` are build tools, not the app.
+
+## Install via flake
+
+```nix
+# flake.nix
+inputs.medialogger.url = "github:acquevoor/medialogger";
+
+# home-manager (or environment.systemPackages)
+home.packages = [ inputs.medialogger.packages.${pkgs.stdenv.hostPlatform.system}.default ];
+```
+
+Includes a desktop entry.
+
 ## What each site does
 
 | Tab | Site | Search | Your history |
@@ -32,8 +56,34 @@ Imported files are checked field by field and rejected as a whole if anything is
 
 ## Files
 
-- Profiles: `~/.local/share/medialogger/profiles/<name>.db` (SQLite)
-- Covers: `~/.cache/medialogger/covers/`, safe to delete
+- Profiles: `~/.local/share/medialogger/profiles/<name>.db` (SQLite). On Windows that's `C:\Users\<you>\.local\share\medialogger\profiles\`.
+- Covers: `~/.cache/medialogger/covers/`, safe to delete.
+
+To move your log to another machine, use **Export…** and **Import…** rather than copying these files.
+
+## Windows (no terminal needed)
+1. Install Python from https://www.python.org/downloads/ . In the installer, tick **"Add python.exe to PATH"** and click *Install Now*.
+2. On this GitHub page click the green **Code** button → **Download ZIP**, then right-click the ZIP → **Extract All**.
+3. Double-click **`medialogger.py`** in the extracted folder. Keep the `medialogger_app` folder next to it.
+   - The first start installs PySide6 by itself (a black window shows progress for a minute or two). Later starts open right away.
+   - If Windows asks which app should open the file, choose **Python**.
+   - Leave the black window open while you use the app; closing it closes the app.
+
+Updates are automatic, see [Updates](#updates).
+
+## Linux AppImage (no install)
+Download `medialogger-x86_64.AppImage` from the repo's **Releases** page, make it executable (`chmod +x medialogger-x86_64.AppImage`, or tick "Allow executing" in your file manager's Properties) and run it.
+
+It's the same app as every other version, and it carries what a desktop would otherwise have to provide: Python, Qt, its own libraries and fonts (Japanese and emoji included, for titles), and the dark look, so it appears the same on every distro. It needs only a Linux desktop with glibc 2.35 or newer (Ubuntu 22.04+, Debian 12+, recent Fedora, Arch, Steam Deck). Each release is tested on Ubuntu 24.04, Debian 12, Fedora and Arch.
+
+To build it yourself, run `appimage/build.sh` on a Debian or Ubuntu machine (on NixOS: `steam-run appimage/build.sh`); `.github/workflows/build.yml` lists the packages it needs. On GitHub, **Actions → Build → Run workflow** builds and tests it on those distros and on Windows, and pushing a `v*` tag publishes it on that release once everything passes.
+
+## Updates
+Every copy updates itself when it starts, so there's nothing to re-download:
+- A `git clone` runs `git pull`.
+- The ZIP, the AppImage and the Nix package download the latest `medialogger_app/` from this repository's `master` into `~/.local/share/medialogger/code/` and run it from there.
+
+If you're offline, or an update is broken, the app starts with the version it has. This runs code from this repository on your machine each time it changes.
 
 ## Development
 

@@ -8,11 +8,14 @@
       forAll = f: nixpkgs.lib.genAttrs [ "x86_64-linux" "aarch64-linux" ] (s: f nixpkgs.legacyPackages.${s});
     in
     {
-      # ponytail: no package.nix, home/medialogger.nix in ~/flake runs the checkout; add one when publishing
+      packages = forAll (pkgs: { default = pkgs.callPackage ./package.nix { }; });
+      apps = forAll (pkgs: {
+        default = { type = "app"; program = "${self.packages.${pkgs.stdenv.hostPlatform.system}.default}/bin/medialogger"; };
+      });
       checks = forAll (pkgs: {
         selftest = pkgs.runCommand "medialogger-selftest" { } ''
           export HOME=$TMPDIR
-          ${pkgs.python3}/bin/python ${self}/medialogger.py --selftest && touch $out
+          ${self.packages.${pkgs.stdenv.hostPlatform.system}.default}/bin/medialogger --selftest && touch $out
         '';
       });
     };

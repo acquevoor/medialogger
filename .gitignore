@@ -1,2 +1,4 @@
+*.AppImage
+build/
 __pycache__/
 result

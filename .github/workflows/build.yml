@@ -1,0 +1,125 @@
+# Builds medialogger-x86_64.AppImage (appimage/build.sh: portable CPython + PySide6-Essentials + the libraries and fonts a
+# desktop session would provide + the app, packed by the official appimagetool) and proves it on bare containers of other
+# distros. Also proves the Windows double-click path on a real Windows machine: a plain Python with no Qt installs
+# PySide6 by itself, self-updates from a ZIP-style folder, and opens the window. Runs by hand (Actions -> Build -> Run
+# workflow) or for a pushed v* tag, which also publishes the AppImage on that tag's GitHub Release, but only if
+# everything passed.
+name: Build
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: The libraries and fonts that go into the AppImage
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q libegl1 libgl1 libopengl0 libglib2.0-0 libdbus-1-3 libfontconfig1 libxkbcommon0 libxkbcommon-x11-0 \
+            libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxcb-xkb1 \
+            libwayland-client0 libwayland-cursor0 libwayland-egl1 libxrender1 libsm6 libice6 \
+            fonts-dejavu-core fonts-noto-cjk fonts-noto-color-emoji
+      - name: Build
+        run: bash appimage/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: medialogger-x86_64.AppImage
+          path: medialogger-x86_64.AppImage
+
+  test:
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: ubuntu-24.04, image: "ubuntu:24.04", deps: "apt-get update -q && apt-get install -y -q xvfb libegl1 libgl1 libglx-mesa0 fontconfig libstdc++6 ca-certificates" }
+          - { name: debian-12, image: "debian:12", deps: "apt-get update -q && apt-get install -y -q xvfb libegl1 libgl1 libglx-mesa0 fontconfig libstdc++6 ca-certificates" }
+          - { name: fedora, image: "fedora:latest", deps: "dnf install -y -q xorg-x11-server-Xvfb mesa-libEGL mesa-libGL mesa-dri-drivers fontconfig" }
+          - { name: arch, image: "archlinux:latest", deps: "pacman -Sy --noconfirm --needed xorg-server-xvfb mesa fontconfig" }
+    container: ${{ matrix.image }}
+    steps:
+      - name: Only what any desktop has (graphics, fontconfig, a display)
+        run: ${{ matrix.deps }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: medialogger-x86_64.AppImage
+      - name: Run it
+        shell: bash
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+          QT_QPA_PLATFORM: xcb
+          DISPLAY: ":99"
+        run: |
+          chmod +x medialogger-x86_64.AppImage
+          Xvfb :99 -screen 0 1400x900x24 &
+          sleep 2
+          ./medialogger-x86_64.AppImage --selftest
+          ./medialogger-x86_64.AppImage --bundle-check
+          ./medialogger-x86_64.AppImage --update | tee update.log
+          grep -E "^(Updated to|Up to date)" update.log
+          grep "^code: .*/medialogger/code/" update.log
+          ./medialogger-x86_64.AppImage --screenshot "$PWD/${{ matrix.name }}.png" 2>&1 | tee run.log
+          test -s "${{ matrix.name }}.png"
+          grep -q "started: Python" run.log
+          ! grep -qE "Traceback|unhandled error|Could not load the Qt platform" run.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screenshot-${{ matrix.name }}
+          path: ${{ matrix.name }}.png
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Like a downloaded ZIP (no .git), on a Python with no Qt
+        shell: bash
+        run: |
+          mkdir plain && cp -r medialogger.py medialogger_app README.md plain/
+          python -c "import PySide6" && exit 1 || true
+      - name: Selftest
+        shell: bash
+        run: python plain/medialogger.py --selftest
+      - name: First double-click installs PySide6 by itself, then opens the window
+        shell: bash
+        run: |
+          python plain/medialogger.py --screenshot "$PWD/windows.png" < /dev/null 2>&1 | tee run.log
+          test -s windows.png
+          grep -q "started: Python" run.log
+          ! grep -qE "Traceback|unhandled error" run.log
+      - name: Self-update from GitHub into the data folder
+        shell: bash
+        run: |
+          python plain/medialogger.py --update < /dev/null | tee update.log
+          grep -E "^(Updated to|Up to date)" update.log
+          grep -E "^code: .*medialogger.code" update.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screenshot-windows
+          path: windows.png
+
+  release:
+    needs: [test, windows]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: medialogger-x86_64.AppImage
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes "Linux AppImage: download, chmod +x, run. Windows: download the source ZIP and double-click medialogger.py (see the README). Tested on Ubuntu 24.04, Debian 12, Fedora, Arch and Windows."
+          gh release upload "$GITHUB_REF_NAME" medialogger-x86_64.AppImage --clobber

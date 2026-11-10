@@ -53,7 +53,7 @@ def test_store(tmp):
     st.set_setting(db, "anilist", "me")
     path = tmp / "out" / "me.json"
     st.export_profile(db, "main", path)
-    assert path.stat().st_mode & 0o777 == 0o600
+    assert os.name == "nt" or path.stat().st_mode & 0o777 == 0o600  # Windows has no such modes
     name = st.import_new(st.read_profile(path) | {"name": "main"})
     assert name == "main (2)" and st.list_profiles() == ["main", "main (2)"]
     copy = st.open_db(name)
@@ -70,6 +70,7 @@ def test_store(tmp):
 
     # a traversal in an imported name stays inside profiles/
     assert "/" not in st.safe_name("../../etc/passwd") and st.safe_name("...") == "profile"
+    assert st.safe_name("con") == "_con" and st.safe_name("Lpt1.txt") == "_Lpt1.txt" and st.safe_name("console") == "console"
     assert st.db_path("../x").parent == st.data_dir() / "profiles"
     db.close()
     copy.close()
@@ -256,6 +257,64 @@ def test_imports(tmp):
     db.close()
 
 
+def test_launcher(tmp):
+    """The launcher: a clone fast-forwards and keeps local edits; without .git a download is installed only if it compiles.
+    Importing it must never install anything: this runs on a Python without Qt."""
+    import importlib.util
+    import shutil
+    import subprocess
+    spec = importlib.util.spec_from_file_location("launcher", Path(__file__).parent.parent / "medialogger.py")
+    launcher = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(launcher)
+
+    def git(folder, *a):
+        subprocess.run(["git", "-C", str(folder), "-c", "user.name=t", "-c", "user.email=t@t", *a], check=True, capture_output=True)
+    up, me, plain = tmp / "up", tmp / "me", tmp / "plain"
+    up.mkdir(), plain.mkdir()
+    if shutil.which("git"):
+        git(up, "init", "-q")
+        (up / "f").write_text("1")
+        git(up, "add", "f")
+        git(up, "commit", "-qm", "1")
+        git(tmp, "clone", "-q", str(up), str(me))
+        (up / "f").write_text("2")
+        git(up, "commit", "-qam", "2")
+        launcher.update(str(me))
+        assert (me / "f").read_text() == "2"
+        (up / "f").write_text("3")
+        git(up, "commit", "-qam", "3")
+        (me / "f").write_text("mine")  # would be overwritten, so git refuses and the app starts anyway
+        launcher.update(str(me))
+        assert (me / "f").read_text() == "mine"
+
+    def fake_zip(**files):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            for name, body in files.items():
+                z.writestr(name.replace("__", "/"), body)
+        return buf.getvalue()
+    sha1, sha2, sha3, code = "a" * 40, "b" * 40, "c" * 40, str(tmp / "code")
+    served = {}
+    launcher.fetch = lambda url, accept="", timeout=30: served["sha"].encode() if "api.github" in url else served["zip"]
+    served.update(sha=sha1, zip=fake_zip(**{"r/medialogger_app/ui.py": "main = 1", "r/evil.py": "x", "r/medialogger_app/sub/x.py": "x"}))
+    launcher.update(str(plain), code)
+    assert launcher.current(code) == str(Path(code, sha1)) and sorted(os.listdir(Path(code, sha1, "medialogger_app"))) == ["ui.py"]
+    served["zip"] = None  # same commit: nothing is downloaded (install would raise, and current stays)
+    launcher.update(str(plain), code)
+    assert launcher.current(code) == str(Path(code, sha1))
+    served.update(sha=sha2, zip=fake_zip(**{"r/medialogger_app/ui.py": "def broken(:"}))
+    launcher.update(str(plain), code)
+    assert launcher.current(code) == str(Path(code, sha1)) and sha2 not in os.listdir(code), "a file that doesn't compile changes nothing"
+    served.update(sha=sha2, zip=fake_zip(**{"r/medialogger_app/ui.py": "main = 2"}))
+    launcher.update(str(plain), code)
+    served.update(sha=sha3, zip=fake_zip(**{"r/medialogger_app/ui.py": "main = 3"}))
+    launcher.update(str(plain), code)
+    assert launcher.current(code) == str(Path(code, sha3)) and sorted(os.listdir(code)) == sorted([sha2, sha3, "current"])
+    served["sha"] = "<html>"
+    launcher.update(str(plain), code)
+    assert launcher.current(code) == str(Path(code, sha3))
+
+
 def selftest():
     with tempfile.TemporaryDirectory() as t:
         tmp = Path(t)
@@ -265,4 +324,5 @@ def selftest():
         test_mapping()
         test_sources()
         test_imports(tmp)
+        test_launcher(tmp)
     print("selftest ok")

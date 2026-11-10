@@ -2,17 +2,20 @@
 import hashlib
 import logging
 import os
+import platform
 import sys
+import threading
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Qt, QUrl, Signal
+from PySide6.QtCore import QObject, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QDesktopServices, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout,
                                QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
                                QPlainTextEdit, QPushButton, QSpinBox, QSplitter, QTableWidget, QTableWidgetItem, QTabWidget, QToolBar, QVBoxLayout, QWidget)
 
-from . import imports, sources, store
+from . import imports, look, sources, store
 
 log = logging.getLogger("medialogger")
 ACTIVE = {"game": "Playing", "anime": "Watching", "manga": "Reading", "music": "Listening", "film": "Watching", "novel": "Reading", "vn": "Reading"}
@@ -528,11 +531,27 @@ class Main(QMainWindow):
 
 def main():
     global bridge
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
+
+    def crash(kind, exc, tb):
+        log.critical("unhandled error: %s", "".join(traceback.format_exception(kind, exc, tb)).rstrip())
+    sys.excepthook = crash
+    threading.excepthook = lambda a: crash(a.exc_type, a.exc_value, a.exc_traceback)
     app = QApplication(sys.argv)
     app.setApplicationName("medialogger")
     app.setDesktopFileName("medialogger")
+    look.apply(app)  # the AppImage only: its own look and fonts
     bridge = Bridge()
+    if "--bundle-check" in sys.argv:
+        sys.exit(1 if look.bundle_check(app) else 0)
+    import PySide6
+    log.info("started: Python %s, PySide6 %s, %s %s", platform.python_version(), PySide6.__version__, platform.system(), platform.release())
+    log.info("profiles in %s", store.data_dir() / "profiles")
     win = Main()
     win.show()
-    sys.exit(app.exec())
+    if "--screenshot" in sys.argv:  # a picture of the real window (CI checks it on several distros and on Windows)
+        shot = sys.argv[sys.argv.index("--screenshot") + 1]
+        QTimer.singleShot(3000, lambda: (log.info("screenshot %s: %s", shot, win.grab().save(shot)), app.quit()))
+    code = app.exec()
+    POOL.shutdown(wait=False, cancel_futures=True)
+    sys.exit(code)

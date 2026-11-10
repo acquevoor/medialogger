@@ -141,9 +141,13 @@ def save_conf(conf):
     write_private(data_dir() / "config.json", json.dumps(conf, indent=1))
 
 
+WINDOWS_RESERVED = re.compile(r"(con|prn|aux|nul|com\d|lpt\d)(\..*)?", re.I)  # Windows can't create these, whatever the extension
+
+
 def safe_name(name):
     """Profile name -> filename stem. Imported names are untrusted: no separators, no leading dots."""
-    return re.sub(r"[^\w ().-]+", "_", name).strip(" .")[:80] or "profile"
+    name = re.sub(r"[^\w ().-]+", "_", name).strip(" .")[:80] or "profile"
+    return "_" + name if WINDOWS_RESERVED.fullmatch(name) else name
 
 
 def db_path(name):
