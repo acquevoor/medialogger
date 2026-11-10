@@ -145,15 +145,17 @@ def test_sources():
               {"data": {"MediaListCollection": {"lists": []}}}])
         r = src.anilist_pull("me")
         assert r == [{"kind": "anime", "site": "anilist", "key": "5", "title": "R", "year": None, "url": "https://anilist.co/anime/5", "cover": "", "status": "active",
-                      "rating": None, "progress": 3, "started": "2020-01-02", "finished": "", "notes": ""}]
+                      "rating": None, "progress": 3, "started": "2020-01-02", "finished": "", "notes": "", "nsfw": False}]
 
         vn = {"title": "Minna de Nyan Nyan", "developers": [{"name": "Yamikumo"}], "image": {"url": "https://t.vndb.org/cv/59/77859.jpg"}, "released": "2003-10-17"}
         calls = stub([{"yorhel": {"id": "u2"}},
                       {"more": True, "results": [{"id": "v1", "vote": 30, "started": None, "finished": None, "notes": None, "labels": [{"label": "Dropped"}, {"label": "Voted"}], "vn": vn}]},
-                      {"more": False, "results": [{"id": "v2", "vote": None, "started": None, "finished": None, "notes": "x", "labels": [{"label": "Blacklist"}], "vn": vn}]}])
+                      {"more": False, "results": [{"id": "v2", "vote": None, "started": None, "finished": None, "notes": "x", "labels": [{"label": "Blacklist"}], "vn": vn}]},
+                      {"more": False, "results": [{"id": "r9", "vns": [{"id": "v1"}, {"id": "v77"}]}]}])
         r = src.vndb_pull("yorhel")
         assert len(r) == 1 and r[0]["rating"] == 3 and r[0]["status"] == "dropped" and r[0]["year"] == 2003
         assert json.loads(calls[2][1])["page"] == 2
+        assert r[0]["nsfw"] is True and '"minage", ">=", 18' in calls[3][1].decode()  # an 18+ release makes the VN adult
         stub([{"nobody": None}])
         try:
             src.vndb_pull("nobody")
@@ -195,13 +197,15 @@ def test_sources():
                   bind("Q1", 0, "Resident Evil 4", d="2005-01-11T00:00:00Z", st="254700", by="Capcom", plats="Nintendo GameCube, Microsoft Windows, Wii, PlayStation 2, Zeebo"),
                   bind("Q2", 1, "Resident Evil 4", d="2023-03-24T00:00:00Z", st="2050650", by="Capcom"),
                   bind("Q3", 2, "Resident Evil 4: Wii Edition", d="2007-05-31T00:00:00Z", wpt="RE4 Wii")]}},
-              "wikipedia.org": {"query": {"pages": [{"title": "RE4 Wii", "thumbnail": {"source": "https://upload.wikimedia.org/wii.jpg"}}]}}})
+              "wikipedia.org": {"query": {"pages": [{"title": "RE4 Wii", "thumbnail": {"source": "https://upload.wikimedia.org/wii.jpg"}}]}},
+              "api.steampowered.com": {"response": {"store_items": [{"appid": 2050650, "content_descriptorids": [2, 5]}, {"appid": 42, "content_descriptorids": [1, 5]}]}}})
         r = src.search("game", "resident evil 4")
         assert [g["key"] for g in r] == ["steam:254700", "steam:2050650", "wikidata:Q3", "steam:42"], [g["key"] for g in r]
         assert [g["year"] for g in r[:3]] == [2005, 2023, 2007] and r[0]["detail"] == "GameCube, Windows, Wii +2"
         assert r[0]["cover"].endswith("/254700/library_600x900.jpg") and r[2]["cover"] == "https://upload.wikimedia.org/wii.jpg" and r[3]["detail"] == "Steam"
         assert r[3]["cover"].endswith("/apps/42/capsule_231x87.jpg")
         assert all(st.cover_ok(g["cover"]) for g in r) and "backloggd.com/search/games/Resident" in r[0]["url"]
+        assert [g["nsfw"] for g in r] == [False, False, False, True], "violence (2) and mature (5) aren't adult; nudity (1) is"
 
         # Wikidata down: Steam's hits still come back; both down: an error
         def wd_down(url, data=None, headers=None, **kw):
@@ -258,6 +262,77 @@ def test_sources():
         assert src.fetch("https://x.test/", sleep=waits.append) == b"ok" and waits == [60]
     finally:
         src.urllib.request.urlopen = real_open
+
+
+def test_adult(tmp):
+    """Adult covers: which signals count, that no source can clear another's flag, and that your choice wins."""
+    assert st.adult({"title": "Hentai Ninja"}) and st.adult({"title": "エロマンガ先生"}) and st.adult({"title": "NTR Paradise"})
+    assert not any(st.adult({"title": t}) for t in ("Essex", "Central Park", "Resident Evil 4", "Sussex", "Eroica"))
+    assert st.adult({"title": "Fine", "nsfw": 1}) and not st.adult({"title": "Hentai Ninja", "nsfw": -1})
+    rejected(lambda: st.clean({**ROW, "nsfw": 2}), "nsfw")
+    assert st.clean({**ROW, "nsfw": True})["nsfw"] == 1 and st.clean(ROW)["nsfw"] == 0
+
+    db = st.open_db("adult")
+    film = {"kind": "film", "site": "letterboxd", "key": "x|2000", "title": "X", "status": "done"}
+    st.apply(db, st.diff(db, [{**film, "nsfw": True}]))
+    d = st.diff(db, [{**film, "nsfw": False, "rating": 6}])  # an RSS pull has no adult flags: it can't clear one
+    assert d["update"] == [(st.find(db, "letterboxd", "x|2000")["id"], {"rating": 6})]
+    st.apply(db, d)
+    assert st.find(db, "letterboxd", "x|2000")["nsfw"] == 1
+    st.save_entry(db, {**st.find(db, "letterboxd", "x|2000"), "nsfw": -1})  # you said it's fine
+    assert st.diff(db, [{**film, "nsfw": True}])["kept"] == 1 and not st.adult(st.find(db, "letterboxd", "x|2000"))
+
+    # round trip, and a profile from before this field still imports
+    path = tmp / "adult.json"
+    st.export_profile(db, "adult", path)
+    assert st.read_profile(path)["entries"][0]["nsfw"] == -1
+    doc = json.loads(path.read_text())
+    for e in doc["entries"]:
+        del e["nsfw"]
+    path.write_text(json.dumps(doc))
+    assert st.read_profile(path)["entries"][0]["nsfw"] == 0
+    db.close()
+
+    # a profile database from before the column existed gets it, and keeps its rows
+    import sqlite3
+    old = st.db_path("old")
+    con = sqlite3.connect(old)
+    con.executescript(st.SCHEMA.replace("nsfw integer not null default 0, ", ""))
+    con.execute("insert into entries(kind,site,key,title,status,created,updated) values('film','letterboxd','y|1','Y','done',1,1)")
+    con.commit()
+    con.close()
+    db = st.open_db("old")
+    assert st.find(db, "letterboxd", "y|1")["nsfw"] == 0
+    st.save_entry(db, {**st.find(db, "letterboxd", "y|1"), "nsfw": 1})
+    assert st.find(db, "letterboxd", "y|1")["nsfw"] == 1
+    db.close()
+
+    real = src.fetch, src.slow_fetch
+    try:
+        stub([{"data": {"Page": {"media": [{"id": i, "siteUrl": "", "title": {"romaji": t, "english": None}, "startDate": {}, "coverImage": {}, "isAdult": a,
+                                            "genres": g, "studios": {"nodes": []}, "staff": {"nodes": []}}
+                                           for i, t, a, g in ((1, "Bible Black", True, ["Hentai"]), (2, "Prison School", False, ["Comedy", "Ecchi"]), (3, "Frieren", False, ["Fantasy"]))]}}}])
+        assert [r["nsfw"] for r in src.search("anime", "x")] == [True, True, False]
+        stub([{"results": [{"id": "v1", "title": "A", "image": {"url": "https://t.vndb.org/a.jpg", "sexual": 1.4}, "released": "2001"},
+                           {"id": "v2", "title": "B", "image": {"url": "https://t.vndb.org/b.jpg", "sexual": 0}, "released": "2002"},
+                           {"id": "v3", "title": "C", "image": None, "released": "2003"}]},
+              {"more": False, "results": [{"id": "r1", "vns": [{"id": "v3"}]}]}])
+        assert [r["nsfw"] for r in src.search("vn", "x")] == [True, False, True]
+        stub([{"series": [{"book": {"image": {"filename": "a.jpg", "nsfw": True}}, "id": 1, "title": "A", "c_start_date": 2001},
+                          {"book": {"image": {"filename": "b.jpg", "nsfw": False}}, "id": 2, "title": "B", "c_start_date": 2002}]}])
+        assert [r["nsfw"] for r in src.search("novel", "x")] == [True, False]
+        calls = stub({"query.wikidata.org": {"results": {"bindings": [
+            {"f": {"value": "http://www.wikidata.org/entity/Q1"}, "ord": {"value": "0"}, "title": {"value": "Emmanuelle"}, "x": {"value": "1"}},
+            {"f": {"value": "http://www.wikidata.org/entity/Q2"}, "ord": {"value": "1"}, "title": {"value": "Heat"}}]}}, "wikipedia.org": {"query": {}}})
+        assert [r["nsfw"] for r in src.search("film", "x")] == [True, False]
+        assert "wd%3AQ185529" in calls[0][0] or "wd:Q185529" in calls[0][0]  # pornographic film is among the adult items
+
+        def steam_down(url, data=None, headers=None, **kw):
+            raise urllib.error.URLError("offline")
+        src.fetch = steam_down
+        assert src.steam_adult(["1"]) == set() and src.steam_adult([]) == set()
+    finally:
+        src.fetch, src.slow_fetch = real
 
 
 def test_imports(tmp):
@@ -365,5 +440,6 @@ def selftest():
         test_mapping()
         test_sources()
         test_imports(tmp)
+        test_adult(tmp)
         test_launcher(tmp)
     print("selftest ok")

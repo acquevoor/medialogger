@@ -87,7 +87,7 @@ def rym_link(artist, title):
 # ---------- AniList ----------
 
 ANILIST = "https://graphql.anilist.co"
-MEDIA = "id siteUrl format episodes chapters title{romaji english} startDate{year} coverImage{large}"
+MEDIA = "id siteUrl format episodes chapters isAdult genres title{romaji english} startDate{year} coverImage{large}"
 SEARCH_Q = "query($s:String,$t:MediaType){Page(perPage:20){media(search:$s,type:$t){%s studios(isMain:true){nodes{name}} staff(perPage:1){nodes{name{full}}}}}}" % MEDIA
 LIST_Q = ("query($u:String,$t:MediaType){MediaListCollection(userName:$u,type:$t){lists{entries{status progress notes"
           " score(format:POINT_10_DECIMAL) startedAt{year month day} completedAt{year month day} media{%s}}}}}") % MEDIA
@@ -96,7 +96,8 @@ ANILIST_STATUS = {"CURRENT": "active", "REPEATING": "active", "PLANNING": "plann
 
 def _anilist_row(kind, m):
     return {"kind": kind, "site": "anilist", "key": str(m["id"]), "title": m["title"]["english"] or m["title"]["romaji"],
-            "year": (m.get("startDate") or {}).get("year"), "url": m.get("siteUrl") or "", "cover": (m.get("coverImage") or {}).get("large") or ""}
+            "year": (m.get("startDate") or {}).get("year"), "url": m.get("siteUrl") or "", "cover": (m.get("coverImage") or {}).get("large") or "",
+            "nsfw": bool(m.get("isAdult") or {"Hentai", "Ecchi"} & set(m.get("genres") or []))}
 
 
 def _anilist_detail(m):
@@ -134,18 +135,37 @@ def anilist_pull(user):
 # ---------- VNDB ----------
 
 VNDB = "https://api.vndb.org/kana"
-VN_FIELDS = "title,image.url,released,developers.name"
+VN_FIELDS = "title,image.url,image.sexual,released,developers.name"
 VNDB_LABELS = (("Playing", "active"), ("Finished", "done"), ("Stalled", "paused"), ("Dropped", "dropped"), ("Wishlist", "planned"))
 
 
 def _vn_row(vid, vn):
     return {"kind": "vn", "site": "vndb", "key": vid, "title": vn["title"], "creator": ", ".join(d["name"] for d in vn.get("developers", [])[:2]),
-            "year": _year(vn.get("released")), "url": f"https://vndb.org/{vid}", "cover": (vn.get("image") or {}).get("url") or ""}
+            "year": _year(vn.get("released")), "url": f"https://vndb.org/{vid}", "cover": (vn.get("image") or {}).get("url") or "",
+            "nsfw": ((vn.get("image") or {}).get("sexual") or 0) >= 1}  # VNDB's vote on the cover: 1 suggestive, 2 explicit
+
+
+def vndb_adult(rows):
+    """Mark VNs with any 18+ release: the work itself is adult even when its cover is safe. Queried 100 at a time."""
+    ids = [r["key"] for r in rows if not r["nsfw"]]
+    adult = set()
+    for i in range(0, len(ids), 100):
+        page = 1
+        while True:
+            doc = _post("VNDB", f"{VNDB}/release", {"filters": ["and", ["minage", ">=", 18], ["vn", "=", ["or", *(["id", "=", v] for v in ids[i:i + 100])]]],
+                                                    "fields": "vns.id", "results": 100, "page": page})
+            adult |= {v["id"] for rel in doc["results"] for v in rel["vns"]}
+            if not doc["more"]:
+                break
+            page += 1
+    for r in rows:
+        r["nsfw"] = r["nsfw"] or r["key"] in adult
+    return rows
 
 
 def vndb_search(q):
     doc = _post("VNDB", f"{VNDB}/vn", {"filters": ["search", "=", q], "fields": VN_FIELDS, "results": 20})
-    return [_vn_row(v["id"], v) for v in doc["results"]]
+    return vndb_adult([_vn_row(v["id"], v) for v in doc["results"]])
 
 
 def vndb_status(labels, vote):
@@ -170,7 +190,7 @@ def vndb_pull(user):
                 out.append({**_vn_row(e["id"], e["vn"]), "status": status, "rating": e["vote"] / 10 if e["vote"] else None,
                             "started": e["started"] or "", "finished": e["finished"] or "", "notes": e["notes"] or ""})
         if not doc["more"]:
-            return out
+            return vndb_adult(out)
         page += 1
 
 
@@ -179,7 +199,7 @@ def vndb_pull(user):
 # One row per item, in the search's own relevance order (apiOrdinal), with what tells same-titled things apart:
 # year, creator (director / developer) and platforms. en,mul labels: Hades has no plain en one.
 SPARQL = """SELECT ?f ?ord (SAMPLE(?lab) AS ?title) (MIN(?date) AS ?d) (SAMPLE(?slug) AS ?lb) (SAMPLE(?steam) AS ?st) (SAMPLE(?wp) AS ?wpt)
-  (SAMPLE(?img) AS ?pic) (GROUP_CONCAT(DISTINCT ?byL; separator=", ") AS ?by) (GROUP_CONCAT(DISTINCT ?platL; separator=", ") AS ?plats) WHERE {
+  (SAMPLE(?img) AS ?pic) (GROUP_CONCAT(DISTINCT ?byL; separator=", ") AS ?by) (GROUP_CONCAT(DISTINCT ?platL; separator=", ") AS ?plats) (MAX(?adult) AS ?x) WHERE {
   SERVICE wikibase:mwapi { bd:serviceParam wikibase:api "EntitySearch"; wikibase:endpoint "www.wikidata.org";
     mwapi:search %s; mwapi:language "en"; wikibase:limit 30 . ?f wikibase:apiOutputItem mwapi:item. ?ord wikibase:apiOrdinal true. }
   ?f %s.
@@ -188,12 +208,16 @@ SPARQL = """SELECT ?f ?ord (SAMPLE(?lab) AS ?title) (MIN(?date) AS ?d) (SAMPLE(?
   OPTIONAL { ?wpa schema:about ?f; schema:isPartOf <https://en.wikipedia.org/>; schema:name ?wp }
   OPTIONAL { ?f wdt:%s ?b. ?b rdfs:label ?byL FILTER(LANG(?byL) = "en") }
   OPTIONAL { ?f wdt:P400 ?p. ?p rdfs:label ?platL FILTER(LANG(?platL) = "en") }
+  OPTIONAL { ?f wdt:P136|wdt:P31|wdt:P852|wdt:P1657 ?a. VALUES ?a { %s } BIND(1 AS ?adult) }
 } GROUP BY ?f ?ord ORDER BY ?ord"""
+# genre, class, ESRB or MPA rating that makes a work adult: eroge, pornographic / erotic video game, ESRB Adults Only 18+;
+# pornographic / erotic / pink film, hentai, ecchi; NC-17, X
+ADULT_ITEMS = "wd:Q1046788 wd:Q7230210 wd:Q3362070 wd:Q14864332 wd:Q185529 wd:Q599558 wd:Q1194365 wd:Q172067 wd:Q219559 wd:Q18665349 wd:Q23817743"
 
 
 def wikidata(q, cls, by):
     """-> [{id, title, year, slug, steam, wp, img, creator, platforms}] in relevance order. by: P57 director, P178 developer."""
-    url = "https://query.wikidata.org/sparql?" + urllib.parse.urlencode({"query": SPARQL % (json.dumps(q), cls, by)})
+    url = "https://query.wikidata.org/sparql?" + urllib.parse.urlencode({"query": SPARQL % (json.dumps(q), cls, by, ADULT_ITEMS)})
     doc = _json("Wikidata", lambda: slow_fetch(url, {"Accept": "application/sparql-results+json"}))
     out = []
     for b in doc["results"]["bindings"]:
@@ -201,7 +225,7 @@ def wikidata(q, cls, by):
         if not v.get("title"):
             continue  # no English or multilingual name
         out.append({"id": v["f"].rsplit("/", 1)[1], "title": v["title"], "year": _year(v.get("d")), "slug": v.get("lb", ""), "steam": v.get("st", ""),
-                    "wp": v.get("wpt", ""), "img": v.get("pic", ""), "creator": v.get("by", ""), "platforms": v.get("plats", "")})
+                    "wp": v.get("wpt", ""), "img": v.get("pic", ""), "creator": v.get("by", ""), "platforms": v.get("plats", ""), "nsfw": v.get("x") == "1"})
     return out
 
 
@@ -248,7 +272,7 @@ def film_search(q):
     for it in items:
         url = f"https://letterboxd.com/film/{urllib.parse.quote(it['slug'])}/" if it["slug"] else _link(LETTERBOXD_SEARCH, it["title"])
         out.append({"kind": "film", "site": "letterboxd", "key": make_key("film", it["title"], it["year"]), "title": it["title"], "year": it["year"],
-                    "creator": it["creator"], "url": url, "cover": covers.get(it["wp"]) or _commons(it["img"])})
+                    "creator": it["creator"], "url": url, "cover": covers.get(it["wp"]) or _commons(it["img"]), "nsfw": it["nsfw"]})
     return out
 
 
@@ -295,13 +319,32 @@ def game_search(q):
         seen.add(key)
         out.append({"kind": "game", "site": "backloggd", "key": key, "title": it["title"], "year": it["year"], "creator": it["creator"],
                     "detail": _platforms(it["platforms"]), "url": _link(BACKLOGGD_SEARCH, it["title"]),
-                    "cover": STEAM_COVER.format(it["steam"]) if it["steam"] else covers.get(it["wp"]) or _commons(it["img"])})
+                    "cover": STEAM_COVER.format(it["steam"]) if it["steam"] else covers.get(it["wp"]) or _commons(it["img"]), "nsfw": it["nsfw"]})
     for appid, name, image in steam:
         if f"steam:{appid}" not in seen:
             seen.add(f"steam:{appid}")
             out.append({"kind": "game", "site": "backloggd", "key": f"steam:{appid}", "title": name, "detail": "Steam",
-                        "url": _link(BACKLOGGD_SEARCH, name), "cover": image})
+                        "url": _link(BACKLOGGD_SEARCH, name), "cover": image, "nsfw": False})
+    adult = steam_adult([r["key"][6:] for r in out if r["key"].startswith("steam:")])
+    for r in out:
+        r["nsfw"] = r["nsfw"] or r["key"][6:] in adult and r["key"].startswith("steam:")
     return out
+
+
+STEAM_SEXUAL = {1, 3, 4}  # Steam's content descriptors: some nudity or sexual content, adult only sexual content, frequent nudity
+
+
+def steam_adult(appids):
+    """-> the appids Steam itself marks for nudity or sexual content, in one request. Pictures and flags only: no error."""
+    if not appids:
+        return set()
+    req = {"ids": [{"appid": int(a)} for a in appids], "context": {"language": "english", "country_code": "US"}, "data_request": {"include_basic_info": True}}
+    url = "https://api.steampowered.com/IStoreBrowseService/GetItems/v1/?" + urllib.parse.urlencode({"input_json": json.dumps(req)})
+    try:
+        items = _json("Steam", lambda: fetch(url)).get("response", {}).get("store_items", [])
+    except RuntimeError:
+        return set()
+    return {str(it["appid"]) for it in items if STEAM_SEXUAL & set(it.get("content_descriptorids") or [])}
 
 
 # ---------- music ----------
@@ -325,10 +368,11 @@ def novel_search(q):
     url = "https://ranobedb.org/api/v0/series?" + urllib.parse.urlencode({"q": q, "limit": 20})
     out = []
     for s in _json("RanobeDB", lambda: fetch(url))["series"]:
-        name = (((s.get("book") or {}).get("image") or {}).get("filename")) or ""
+        image = (s.get("book") or {}).get("image") or {}
+        name = image.get("filename") or ""
         out.append({"kind": "novel", "site": "ranobedb", "key": str(s["id"]), "title": s.get("title") or s.get("romaji_orig") or s["title_orig"],
                     "year": _year(s.get("c_start_date")), "url": f"https://ranobedb.org/series/{s['id']}",
-                    "cover": f"https://images.ranobedb.org/{name}" if name else ""})
+                    "cover": f"https://images.ranobedb.org/{name}" if name else "", "nsfw": bool(image.get("nsfw"))})
     return out
 
 

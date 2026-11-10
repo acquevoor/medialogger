@@ -10,8 +10,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QRect, QSize, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QFontMetrics, QKeySequence, QPixmap, QShortcut
-from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout,
+from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QFontMetrics, QKeySequence, QPainter, QPixmap, QShortcut
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout,
                                QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
                                QPlainTextEdit, QPushButton, QSpinBox, QSplitter, QStyle, QStyledItemDelegate, QTableWidget, QTableWidgetItem, QTabWidget, QToolBar, QVBoxLayout, QWidget)
 
@@ -112,8 +112,9 @@ class LogDialog(QDialog):
         self.started = QLineEdit(row.get("started", ""), placeholderText="YYYY-MM-DD")
         self.finished = QLineEdit(row.get("finished", ""), placeholderText="YYYY-MM-DD")
         self.notes = QPlainTextEdit(row.get("notes", ""))
+        self.adult = QCheckBox("blur the cover", checked=store.adult(row))
         for label, w in (("Title", self.title_), ("Creator", self.creator), ("Year", self.year), ("Status", self.status), ("Rating (0–10)", self.rating),
-                         ("Progress", self.progress), ("Started", self.started), ("Finished", self.finished), ("Notes", self.notes)):
+                         ("Progress", self.progress), ("Started", self.started), ("Finished", self.finished), ("Adult", self.adult), ("Notes", self.notes)):
             form.addRow(label, w)
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.save)
@@ -125,6 +126,9 @@ class LogDialog(QDialog):
         row.update(title=self.title_.text().strip(), creator=self.creator.text().strip(), year=self.year.value() if self.year.value() >= 1000 else None,
                    status=self.status.currentData(), rating=self.rating.value() or None, progress=self.progress.value() or None,
                    started=self.started.text().strip(), finished=self.finished.text().strip(), notes=self.notes.toPlainText())
+        # ticked: adult. Unticked: -1 only where something would still call it adult (a site flag, the title), so a
+        # later title change can still blur an entry you never decided on
+        row["nsfw"] = 1 if self.adult.isChecked() else -1 if store.adult({**row, "nsfw": 0}) or self.row.get("nsfw") == 1 else 0
         if not row.get("key"):  # a hand-made entry
             kind = row["kind"]
             row["site"] = store.SITE_OF[kind] if kind in MANUAL_SHARED else "manual"
@@ -138,13 +142,34 @@ class LogDialog(QDialog):
 
 
 TILE_W, TILE_H = 150, 225  # 2:3, the shape of a poster or box
-COVER_ROLE, LINES_ROLE = Qt.UserRole + 1, Qt.UserRole + 2
+COVER_ROLE, LINES_ROLE, BLUR_ROLE = Qt.UserRole + 1, Qt.UserRole + 2, Qt.UserRole + 3
+
+
+def blur(pix):
+    """Shrink to a few pixels and back: nothing recognisable survives, the colours do."""
+    small = pix.scaled(max(1, pix.width() // 16), max(1, pix.height() // 16), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+    return small.scaled(pix.width(), pix.height(), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+
+
+def badge(p, box, text="18+"):
+    """A dark pill in the middle of a cover."""
+    f = QFont(p.font())
+    f.setBold(True)
+    p.setFont(f)
+    w = QFontMetrics(f).horizontalAdvance(text) + 16
+    pill = QRect(box.center().x() - w // 2, box.center().y() - 12, w, 24)
+    p.setPen(Qt.NoPen)
+    p.setBrush(QColor(0, 0, 0, 170))
+    p.drawRoundedRect(pill, 12, 12)
+    p.setPen(QColor("white"))
+    p.drawText(pill, Qt.AlignCenter, text)
 
 
 class Tile(QStyledItemDelegate):
     """One search result: the cover (or a "no cover" card) and a caption that always has room for what tells same-titled
     things apart: the title on up to two lines, then year · creator, then the detail (platforms, format, release type)."""
     PAD, CAPTION = 8, 74
+    reveal = False  # the dialog's "Show adult covers"
 
     def sizeHint(self, option, index):
         return QSize(TILE_W + 2 * self.PAD, TILE_H + self.CAPTION + 2 * self.PAD)
@@ -156,13 +181,18 @@ class Tile(QStyledItemDelegate):
             p.fillRect(r, pal.highlight())
         fg = pal.highlightedText().color() if option.state & QStyle.State_Selected else pal.text().color()
         box = QRect(r.left() + (r.width() - TILE_W) // 2, r.top() + self.PAD, TILE_W, TILE_H)
-        pix = index.data(COVER_ROLE)
+        hide = index.data(BLUR_ROLE) is not None and not self.reveal
+        pix = index.data(BLUR_ROLE) if hide and index.data(BLUR_ROLE) else index.data(COVER_ROLE)
         if pix:
             p.drawPixmap(box.left() + (TILE_W - pix.width()) // 2, box.top() + (TILE_H - pix.height()) // 2, pix)
         else:
             p.fillRect(box, pal.alternateBase())
             p.setPen(pal.placeholderText().color())
             p.drawText(box, Qt.AlignCenter, "no cover" if index.data(Qt.UserRole) == "none" else "…")
+        if hide:
+            p.save()
+            badge(p, box)
+            p.restore()
         title, meta, detail = index.data(LINES_ROLE)
         y, w = box.bottom() + 6, r.width() - 2 * self.PAD
         bold = QFont(option.font)
@@ -209,6 +239,8 @@ class ResultsDialog(QDialog):
             item = QListWidgetItem()
             item.setData(LINES_ROLE, (title, meta, r.get("detail", "")))
             item.setData(Qt.UserRole, "wait" if r.get("cover") else "none")
+            if store.adult(r):
+                item.setData(BLUR_ROLE, False)  # blurred version comes with the cover; False: nothing to show yet
             item.setToolTip("\n".join(x for x in (r["title"], meta, r.get("detail", "")) if x) + ("\n\nAlready in your log" if logged else ""))
             self.grid.addItem(item)
             if r.get("cover"):
@@ -217,12 +249,16 @@ class ResultsDialog(QDialog):
         self.grid.itemActivated.connect(self.pick)
         box.addWidget(self.grid)
         hint = QLabel("Double-click a cover to log it.", textFormat=Qt.PlainText)
+        self.show_adult = QCheckBox(f"Show adult covers ({sum(map(store.adult, rows))})")
+        self.show_adult.setVisible(any(map(store.adult, rows)))
+        self.show_adult.toggled.connect(self.reveal)
         buttons = QDialogButtonBox(QDialogButtonBox.Cancel)
         buttons.addButton("Log selected", QDialogButtonBox.AcceptRole).clicked.connect(self.pick)
         buttons.addButton("Enter by hand…", QDialogButtonBox.ActionRole).clicked.connect(self.manual)
         buttons.rejected.connect(self.reject)
         row = QHBoxLayout()
         row.addWidget(hint, 1)
+        row.addWidget(self.show_adult)
         row.addWidget(buttons)
         box.addLayout(row)
         self.grid.setCurrentRow(0)
@@ -232,9 +268,16 @@ class ResultsDialog(QDialog):
             return
         pix = None if err else QPixmap(str(path))
         if pix and not pix.isNull():
-            item.setData(COVER_ROLE, pix.scaled(TILE_W, TILE_H, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            pix = pix.scaled(TILE_W, TILE_H, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            if item.data(BLUR_ROLE) is not None:
+                item.setData(BLUR_ROLE, blur(pix))  # before the cover itself: never a frame of it unblurred
+            item.setData(COVER_ROLE, pix)
         else:
             item.setData(Qt.UserRole, "none")  # a 404 or an unreadable file: say so instead of loading forever
+
+    def reveal(self, on):
+        self.grid.itemDelegate().reveal = on
+        self.grid.viewport().update()
 
     def done(self, code):
         self.alive = False
@@ -368,6 +411,8 @@ class Tab(QWidget):
         pane = QWidget()
         side = QVBoxLayout(pane)
         self.cover = QLabel(alignment=Qt.AlignCenter, minimumHeight=240)
+        self.cover.mousePressEvent = lambda _: self.reveal_cover()
+        self.revealed, self.cover_pix = set(), None  # entries whose adult cover you clicked open, this session
         self.heading = QLabel(textFormat=Qt.PlainText, wordWrap=True)
         self.heading.setStyleSheet("font-weight: bold")
         self.meta = QLabel(textFormat=Qt.PlainText, wordWrap=True)
@@ -448,6 +493,7 @@ class Tab(QWidget):
             b.setEnabled(bool(e))
         self.link_btn.setEnabled(bool(e and e["url"]))
         self.cover.clear()
+        self.cover_pix = None
         if not e:
             self.heading.clear(), self.meta.clear(), self.notes.clear()
             return
@@ -462,7 +508,27 @@ class Tab(QWidget):
 
     def got_cover(self, entry_id, path, err):
         if not err and self.current and self.current["id"] == entry_id:
-            self.cover.setPixmap(QPixmap(str(path)).scaled(240, 240, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            self.cover_pix = QPixmap(str(path)).scaled(240, 240, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.paint_cover()
+
+    def paint_cover(self):
+        e, pix = self.current, self.cover_pix
+        if not e or not pix or pix.isNull():
+            return
+        if store.adult(e) and e["id"] not in self.revealed:
+            pix = blur(pix)
+            p = QPainter(pix)
+            badge(p, pix.rect(), "18+ · click to show")
+            p.end()
+            self.cover.setToolTip("Adult cover: click to show it")
+        else:
+            self.cover.setToolTip("")
+        self.cover.setPixmap(pix)
+
+    def reveal_cover(self):
+        if self.current:
+            self.revealed ^= {self.current["id"]}  # click again to blur it back
+            self.paint_cover()
 
     def do_search(self):
         q = self.search.text().strip()

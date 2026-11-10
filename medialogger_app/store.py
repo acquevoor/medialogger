@@ -22,7 +22,7 @@ USERNAMES = ("anilist", "vndb", "letterboxd")
 # every host a cover may come from, redirects included: a crafted profile must not make the app call anything else
 COVER_HOSTS = ("anilist.co", "vndb.org", "ranobedb.org", "steamstatic.com", "coverartarchive.org", "archive.org", "wikimedia.org", "ltrbxd.com")
 
-SITE_FIELDS = ("title", "creator", "year", "url", "cover", "status", "rating", "progress", "started", "finished", "notes")
+SITE_FIELDS = ("title", "creator", "year", "url", "cover", "status", "rating", "progress", "started", "finished", "notes", "nsfw")
 FIELDS = ("kind", "site", "key", *SITE_FIELDS, "edited", "created", "updated")
 FORMAT, VERSION = "medialogger-profile", 1
 MAX_FILE, MAX_ENTRIES = 64 << 20, 200_000
@@ -31,10 +31,23 @@ create table if not exists entries(
   id integer primary key, kind text not null, site text not null, key text not null, title text not null,
   creator text not null default '', year integer, url text not null default '', cover text not null default '',
   status text not null, rating real, progress integer, started text not null default '', finished text not null default '',
-  notes text not null default '', edited integer not null default 0, created integer not null, updated integer not null,
+  notes text not null default '', nsfw integer not null default 0, edited integer not null default 0, created integer not null, updated integer not null,
   unique(site, key));
 create table if not exists settings(k text primary key, v text not null);
 """
+
+
+# titles that say what the work is. ponytail: a word list, so it misses some and blurs a few innocent ones
+# (Sex Pistols); every cover is one click from shown, and the Log dialog's Adult box overrides it either way
+ADULT_WORDS = re.compile(r"(?<![a-z])(hentai|ecchi|eroge|nukige|porno?|pornographic|xxx|nsfw|r-?18|18\+|uncensored|lewd|nude|naked|nudity|"
+                         r"sex|sexy|sexual|erotic|erotica|fetish|bdsm|milf|futanari|ahegao|oppai|ntr)(?![a-z])"
+                         r"|エロ|エッチ|えっち|18禁|成人向け|淫|陵辱|凌辱|触手|調教|中出し|孕ま|痴漢|痴女|爆乳|催眠|寝取", re.I)
+
+
+def adult(entry):
+    """Blur this cover? nsfw 1: a site or you said adult. -1: you said it's fine, whatever the title. 0: the title decides."""
+    nsfw = entry.get("nsfw") or 0
+    return nsfw > 0 or nsfw == 0 and bool(ADULT_WORDS.search(entry.get("title", "")))
 
 
 def norm(s):
@@ -102,6 +115,10 @@ def clean(r):
     out["rating"] = rating
     out["started"], out["finished"] = _date(r, "started"), _date(r, "finished")
     out["notes"] = _text(r, "notes", 100_000)
+    nsfw = r.get("nsfw") or 0  # absent in profiles from before adult covers were blurred
+    if nsfw not in (-1, 0, 1):
+        raise ValueError(f"nsfw must be -1, 0 or 1: {nsfw!r}")
+    out["nsfw"] = int(nsfw)
     out["edited"] = 1 if r.get("edited") else 0
     out["created"] = _int({"created": r.get("created", 0)}, "created", 0, 1 << 40)
     out["updated"] = _int({"updated": r.get("updated", 0)}, "updated", 0, 1 << 40)
@@ -172,6 +189,9 @@ def open_db(name):
     db = sqlite3.connect(path)
     db.row_factory = sqlite3.Row
     db.executescript(SCHEMA)
+    if "nsfw" not in {c["name"] for c in db.execute("pragma table_info(entries)")}:  # profiles made before covers were blurred
+        with db:
+            db.execute("alter table entries add column nsfw integer not null default 0")
     return db
 
 
@@ -222,6 +242,12 @@ def delete_entry(db, entry_id):
         db.execute("delete from entries where id=?", (entry_id,))
 
 
+def _known(field, value):
+    """Whether a site said something. For nsfw only an adult flag (1) counts: 0 means "no flag seen", and a source
+    without adult flags (an RSS feed, a CSV) must not clear one another source set."""
+    return value not in ("", None) and not (field == "nsfw" and value != 1)
+
+
 def diff(db, rows):
     """What a pull or file import would do, without doing it. -> {new, update, kept, same}.
     Rows sharing a key fold together in order, so later files fill in what earlier ones lacked."""
@@ -232,7 +258,7 @@ def diff(db, rows):
             r["cover"] = ""  # a site's unknown CDN costs a picture, not the whole sync
         r = clean(r)
         k = r["site"], r["key"]
-        merged[k] = {**merged[k], **{f: r[f] for f in SITE_FIELDS if r[f] not in ("", None)}} if k in merged else r
+        merged[k] = {**merged[k], **{f: r[f] for f in SITE_FIELDS if _known(f, r[f])}} if k in merged else r
     out = {"new": [], "update": [], "kept": 0, "same": 0}
     for (site, key), r in merged.items():
         old = find(db, site, key)
@@ -241,7 +267,7 @@ def diff(db, rows):
         elif old["edited"]:
             out["kept"] += 1
         else:
-            changes = {f: r[f] for f in SITE_FIELDS if r[f] not in ("", None) and r[f] != old[f]}
+            changes = {f: r[f] for f in SITE_FIELDS if _known(f, r[f]) and r[f] != old[f]}
             if changes:
                 out["update"].append((old["id"], changes))
             else:
