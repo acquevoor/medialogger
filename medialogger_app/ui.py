@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QDial
                                QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
                                QPlainTextEdit, QPushButton, QSpinBox, QSplitter, QTableWidget, QTableWidgetItem, QTabWidget, QToolBar, QVBoxLayout, QWidget)
 
-from . import imports, look, sources, store
+from . import imports, sources, store
 
 log = logging.getLogger("medialogger")
 ACTIVE = {"game": "Playing", "anime": "Watching", "manga": "Reading", "music": "Listening", "film": "Watching", "novel": "Reading", "vn": "Reading"}
@@ -540,16 +540,13 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("medialogger")
     app.setDesktopFileName("medialogger")
-    look.apply(app)  # the AppImage only: its own look and fonts
     bridge = Bridge()
-    if "--bundle-check" in sys.argv:
-        sys.exit(1 if look.bundle_check(app) else 0)
     import PySide6
     log.info("started: Python %s, PySide6 %s, %s %s", platform.python_version(), PySide6.__version__, platform.system(), platform.release())
     log.info("profiles in %s", store.data_dir() / "profiles")
     win = Main()
     win.show()
-    if "--screenshot" in sys.argv:  # a picture of the real window (CI checks it on several distros and on Windows)
+    if "--screenshot" in sys.argv:  # a picture of the real window (CI checks it on Linux and Windows)
         shot = sys.argv[sys.argv.index("--screenshot") + 1]
         QTimer.singleShot(3000, lambda: (log.info("screenshot %s: %s", shot, win.grab().save(shot)), app.quit()))
     code = app.exec()

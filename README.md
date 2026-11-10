@@ -7,12 +7,11 @@ PySide6 + Python stdlib.
 ## Which way to run it
 | You're on | Do this |
 |---|---|
-| **Linux** (including Bazzite, SteamOS, Fedora Atomic) | Download the **AppImage** from Releases: nothing to install. See [Linux AppImage](#linux-appimage-no-install). |
 | **Windows** | Install Python, then double-click `medialogger.py`. See [Windows](#windows-no-terminal-needed). |
 | **NixOS / Nix** | `nix run github:acquevoor/medialogger` |
-| **Linux with Python, from source** | `python3 medialogger.py` in this folder. It installs PySide6 with pip on first run. |
+| **Linux** | `python3 medialogger.py` in this folder. See [Linux](#linux). |
 
-`medialogger.py` is the only file you start. The files in `appimage/` are build tools, not the app.
+`medialogger.py` is the only file you start.
 
 ## Install via flake
 
@@ -58,6 +57,7 @@ Imported files are checked field by field and rejected as a whole if anything is
 
 - Profiles: `~/.local/share/medialogger/profiles/<name>.db` (SQLite). On Windows that's `C:\Users\<you>\.local\share\medialogger\profiles\`.
 - Covers: `~/.cache/medialogger/covers/`, safe to delete.
+- PySide6: `~/.local/share/medialogger/venv/`, made on the first start; safe to delete, the next start makes it again.
 
 To move your log to another machine, use **Export…** and **Import…** rather than copying these files.
 
@@ -65,23 +65,28 @@ To move your log to another machine, use **Export…** and **Import…** rather 
 1. Install Python from https://www.python.org/downloads/ . In the installer, tick **"Add python.exe to PATH"** and click *Install Now*.
 2. On this GitHub page click the green **Code** button → **Download ZIP**, then right-click the ZIP → **Extract All**.
 3. Double-click **`medialogger.py`** in the extracted folder. Keep the `medialogger_app` folder next to it.
-   - The first start installs PySide6 by itself (a black window shows progress for a minute or two). Later starts open right away.
+   - The first start sets up PySide6 by itself (a black window shows progress for a minute or two). Later starts open right away.
    - If Windows asks which app should open the file, choose **Python**.
    - Leave the black window open while you use the app; closing it closes the app.
 
 Updates are automatic, see [Updates](#updates).
 
-## Linux AppImage (no install)
-Download `medialogger-x86_64.AppImage` from the repo's **Releases** page, make it executable (`chmod +x medialogger-x86_64.AppImage`, or tick "Allow executing" in your file manager's Properties) and run it.
+## Linux
+Any distro with Python 3.10 or newer:
 
-It's the same app as every other version, and it carries what a desktop would otherwise have to provide: Python, Qt, its own libraries and fonts (Japanese and emoji included, for titles), and the dark look, so it appears the same on every distro. It needs only a Linux desktop with glibc 2.35 or newer (Ubuntu 22.04+, Debian 12+, recent Fedora, Arch, Steam Deck). Each release is tested on Ubuntu 24.04, Debian 12, Fedora and Arch.
+1. `git clone https://github.com/acquevoor/medialogger` (or **Code** → **Download ZIP** and extract it).
+2. `python3 medialogger/medialogger.py`
 
-To build it yourself, run `appimage/build.sh` on a Debian or Ubuntu machine (on NixOS: `steam-run appimage/build.sh`); `.github/workflows/build.yml` lists the packages it needs. On GitHub, **Actions → Build → Run workflow** builds and tests it on those distros and on Windows, and pushing a `v*` tag publishes it on that release once everything passes.
+The first start makes the app's own Python environment in `~/.local/share/medialogger/venv/` and installs PySide6 there, so it needs no root and leaves your system Python alone. Later starts open right away.
+
+- **Debian or Ubuntu:** if it says it couldn't create the environment, run `sudo apt install python3-venv` once.
+- **No window on X11** ("could not load the Qt platform plugin xcb"): install `libxcb-cursor0` (Debian, Ubuntu) or `xcb-util-cursor` (Fedora, Arch).
+- **NixOS:** use the flake instead; pip's Qt can't load there.
 
 ## Updates
 Every copy updates itself when it starts, so there's nothing to re-download:
 - A `git clone` runs `git pull`.
-- The ZIP, the AppImage and the Nix package download the latest `medialogger_app/` from this repository's `master` into `~/.local/share/medialogger/code/` and run it from there.
+- The ZIP and the Nix package download the latest `medialogger_app/` from this repository's `master` into `~/.local/share/medialogger/code/` and run it from there.
 
 If you're offline, or an update is broken, the app starts with the version it has. This runs code from this repository on your machine each time it changes.
 

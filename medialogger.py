@@ -16,28 +16,51 @@ import zipfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)  # the medialogger_app/ folder next to this file
 REPO = "acquevoor/medialogger"
-CODE = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"), "medialogger", "code")
+DATA = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"), "medialogger")
+CODE = os.path.join(DATA, "code")
+VENV = os.path.join(DATA, "venv")
+VENV_PY = os.path.join(VENV, "Scripts", "python.exe") if os.name == "nt" else os.path.join(VENV, "bin", "python")
+
+
+def stop(msg):
+    input(f"{msg}\nPress Enter to close.")
+    sys.exit(1)
+
+
+def restart(python):
+    sys.exit(subprocess.call([python, os.path.abspath(__file__)] + sys.argv[1:]))
 
 
 def ensure_pyside():
-    """First double-click on a plain Python install (e.g. Windows): fetch PySide6, then restart.
-    Called only when the window is about to open, never on import: the selftest imports this file on a Python without Qt."""
+    """On a plain Python (Windows double-click, a Linux distro's python3) the app runs in its own venv, made and filled
+    with PySide6 on the first start. A venv, because distro Pythons refuse pip installs into themselves (PEP 668), and it
+    needs no admin rights anywhere. Called only when the window is about to open, never on import: the selftest
+    imports this file on a Python without Qt."""
     try:
         import PySide6.QtWidgets  # noqa: F401
         return
     except ImportError as e:
-        # only install when PySide6 is truly absent; installed-but-broken gets the error, not a reinstall.
-        # one attempt only: if the fresh install still can't import, a restart loop would fork-bomb the machine
-        if importlib.util.find_spec("PySide6") or os.environ.get("MEDIALOGGER_PIP_TRIED"):
-            input(f"PySide6 is installed but can't load: {e}\nPress Enter to close.")
-            sys.exit(1)
-    print("First run: installing PySide6, this takes a minute or two. Keep this window open...")
+        err = e
+    tried = os.environ.get("MEDIALOGGER_PIP_TRIED")
+    if os.path.realpath(sys.prefix) != os.path.realpath(VENV):
+        if not os.path.exists(VENV_PY):
+            if tried:
+                stop(f"PySide6 can't load: {err}")
+            print("First run: setting up, this takes a minute or two. Keep this window open...")
+            if subprocess.call([sys.executable, "-m", "venv", VENV]):
+                shutil.rmtree(VENV, ignore_errors=True)  # a half-made venv (no pip) would fail the same way every start
+                stop("Couldn't create the app's Python environment (see above). On Debian or Ubuntu: sudo apt install python3-venv")
+        restart(VENV_PY)
+    # inside the venv. Only install when PySide6 is truly absent; installed-but-broken gets the error, not a reinstall.
+    # One attempt only: if the fresh install still can't import, a restart loop would fork-bomb the machine
+    if importlib.util.find_spec("PySide6") or tried:
+        stop(f"PySide6 is installed but can't load: {err}")
+    print("Installing PySide6...")
     # Essentials: Qt without the built-in browser this app never uses, a third of the download
-    if subprocess.call([sys.executable, "-m", "pip", "install", "PySide6-Essentials"]):
-        input("Installing PySide6 failed (see above). Press Enter to close.")
-        sys.exit(1)
+    if subprocess.call([sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "PySide6-Essentials"]):
+        stop("Installing PySide6 failed (see above).")
     os.environ["MEDIALOGGER_PIP_TRIED"] = "1"
-    sys.exit(subprocess.call([sys.executable] + sys.argv))
+    restart(sys.executable)
 
 
 def fetch(url, accept="*/*", timeout=30):
@@ -85,7 +108,7 @@ def install(data, sha, code):
 
 def update(folder=HERE, code=CODE):
     """Never stops the app: offline, no git, local edits in the way or a bad download just means it starts as it is.
-    A clone pulls. A ZIP, the AppImage and the Nix package have no .git (and two of them are read-only), so the
+    A clone pulls. A ZIP and the Nix package have no .git (and the Nix one is read-only), so the
     latest medialogger_app/ goes in CODE, which is run instead of the copy next to this file."""
     try:
         if os.path.exists(os.path.join(folder, ".git")):
@@ -134,7 +157,7 @@ if __name__ == "__main__":
         t.start()
         t.join(90 if sys.argv[1:] else 20)
     main = load()
-    if sys.argv[1:] == ["--update"]:  # the AppImage's build checks this: the download worked and loads in here
+    if sys.argv[1:] == ["--update"]:  # CI checks this: the download worked and loads in here
         print("code:", sys.modules[main.__module__].__file__)
     else:
         main()

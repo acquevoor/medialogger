@@ -1,0 +1,90 @@
+# Proves the plain-Python path on a real Windows machine and on a stock Ubuntu python3 (which refuses pip installs into
+# itself): from a ZIP-style folder with no Qt, the first start makes the app's venv, installs PySide6 into it and opens
+# the window; then the copy updates itself from master. Runs for every push to master, or by hand.
+name: Test
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Like a downloaded ZIP (no .git), on a Python with no Qt
+        shell: bash
+        run: |
+          mkdir plain && cp -r medialogger.py medialogger_app README.md plain/
+          ! python -c "import PySide6"
+      - name: Selftest
+        shell: bash
+        run: python plain/medialogger.py --selftest
+      - name: First double-click sets up PySide6 by itself, then opens the window
+        shell: bash
+        run: |
+          python plain/medialogger.py --screenshot "$PWD/shot.png" < /dev/null 2>&1 | tee run.log
+          test -s shot.png
+          grep -q "started: Python" run.log
+          ! grep -qE "Traceback|unhandled error" run.log
+      - name: Second start goes straight to the venv
+        shell: bash
+        run: |
+          python plain/medialogger.py --screenshot "$PWD/shot2.png" < /dev/null 2>&1 | tee run2.log
+          ! grep -q "First run" run2.log
+          test -s shot2.png
+      - name: Self-update from GitHub into the data folder
+        shell: bash
+        run: |
+          python plain/medialogger.py --update < /dev/null | tee update.log
+          grep -E "^(Updated to|Up to date)" update.log
+          grep -E "^code: .*medialogger.code" update.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screenshot-windows
+          path: shot.png
+
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    container: ubuntu:24.04
+    steps:
+      - name: A desktop's python3 and graphics libraries, plus a display for the test
+        run: |
+          apt-get update -q
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -q python3 python3-venv ca-certificates xvfb libegl1 libgl1 libglx-mesa0 \
+            libfontconfig1 libdbus-1-3 libglib2.0-0 libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1 libxcb-shape0 fonts-dejavu-core
+      - uses: actions/checkout@v4
+      - name: Like a downloaded ZIP (no .git), on a distro Python that refuses pip installs
+        run: |
+          mkdir plain && cp -r medialogger.py medialogger_app README.md plain/
+          ! python3 -m pip install --dry-run PySide6-Essentials
+      - name: Selftest
+        run: python3 plain/medialogger.py --selftest
+      - name: First start sets up PySide6 by itself, then opens the window
+        shell: bash
+        env:
+          QT_QPA_PLATFORM: xcb
+          DISPLAY: ":99"
+        run: |
+          Xvfb :99 -screen 0 1400x900x24 &
+          sleep 2
+          python3 plain/medialogger.py --screenshot "$PWD/shot.png" < /dev/null 2>&1 | tee run.log
+          test -s shot.png
+          grep -q "started: Python" run.log
+          ! grep -qE "Traceback|unhandled error|Could not load the Qt platform" run.log
+      - name: Self-update from GitHub into the data folder
+        shell: bash
+        run: |
+          python3 plain/medialogger.py --update < /dev/null | tee update.log
+          grep -E "^(Updated to|Up to date)" update.log
+          grep "^code: .*/medialogger/code/" update.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screenshot-linux
+          path: shot.png
