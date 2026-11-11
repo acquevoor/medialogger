@@ -88,7 +88,8 @@ def rym_link(artist, title):
 
 ANILIST = "https://graphql.anilist.co"
 MEDIA = "id siteUrl format episodes chapters isAdult genres title{romaji english} startDate{year} coverImage{large}"
-SEARCH_Q = "query($s:String,$t:MediaType){Page(perPage:20){media(search:$s,type:$t){%s studios(isMain:true){nodes{name}} staff(perPage:1){nodes{name{full}}}}}}" % MEDIA
+SEARCH_Q = ("query($s:String,$t:MediaType){Page(perPage:20){media(search:$s,type:$t){%s title{native} synonyms"
+            " studios(isMain:true){nodes{name}} staff(perPage:1){nodes{name{full}}}}}}") % MEDIA
 LIST_Q = ("query($u:String,$t:MediaType){MediaListCollection(userName:$u,type:$t){lists{entries{status progress notes"
           " score(format:POINT_10_DECIMAL) startedAt{year month day} completedAt{year month day} media{%s}}}}}") % MEDIA
 ANILIST_STATUS = {"CURRENT": "active", "REPEATING": "active", "PLANNING": "planned", "COMPLETED": "done", "PAUSED": "paused", "DROPPED": "dropped"}
@@ -112,7 +113,9 @@ def anilist_search(kind, q):
     out = []
     for m in doc["data"]["Page"]["media"]:
         names = [n["name"] for n in m["studios"]["nodes"]] if kind == "anime" else [n["name"]["full"] for n in m["staff"]["nodes"]]
-        out.append({**_anilist_row(kind, m), "creator": ", ".join(names[:2]), "detail": _anilist_detail(m)})
+        t = m["title"]
+        out.append({**_anilist_row(kind, m), "creator": ", ".join(names[:2]), "detail": _anilist_detail(m),
+                    "alt": [x for x in (t.get("romaji"), t.get("english"), t.get("native"), *(m.get("synonyms") or [])) if x]})
     return out
 
 
@@ -164,8 +167,8 @@ def vndb_adult(rows):
 
 
 def vndb_search(q):
-    doc = _post("VNDB", f"{VNDB}/vn", {"filters": ["search", "=", q], "fields": VN_FIELDS, "results": 20})
-    return vndb_adult([_vn_row(v["id"], v) for v in doc["results"]])
+    doc = _post("VNDB", f"{VNDB}/vn", {"filters": ["search", "=", q], "fields": VN_FIELDS + ",alttitle,aliases", "results": 20})
+    return vndb_adult([{**_vn_row(v["id"], v), "alt": [x for x in (v.get("alttitle"), *(v.get("aliases") or [])) if x]} for v in doc["results"]])
 
 
 def vndb_status(labels, vote):
@@ -334,17 +337,26 @@ def game_search(q):
 STEAM_SEXUAL = {1, 3, 4}  # Steam's content descriptors: some nudity or sexual content, adult only sexual content, frequent nudity
 
 
-def steam_adult(appids):
-    """-> the appids Steam itself marks for nudity or sexual content, in one request. Pictures and flags only: no error."""
-    if not appids:
-        return set()
-    req = {"ids": [{"appid": int(a)} for a in appids], "context": {"language": "english", "country_code": "US"}, "data_request": {"include_basic_info": True}}
-    url = "https://api.steampowered.com/IStoreBrowseService/GetItems/v1/?" + urllib.parse.urlencode({"input_json": json.dumps(req)})
-    try:
-        items = _json("Steam", lambda: fetch(url)).get("response", {}).get("store_items", [])
-    except RuntimeError:
-        return set()
-    return {str(it["appid"]) for it in items if STEAM_SEXUAL & set(it.get("content_descriptorids") or [])}
+def steam_items(appids):
+    """appid -> Steam's store item (name, type 0 = game, content descriptors), 100 per request, keyless.
+    Flags and names only: a failed lookup gives nothing rather than an error."""
+    ids, out = [int(a) for a in dict.fromkeys(appids)], {}
+    for i in range(0, len(ids), 100):
+        req = {"ids": [{"appid": a} for a in ids[i:i + 100]], "context": {"language": "english", "country_code": "US"},
+               "data_request": {"include_basic_info": True}}
+        url = "https://api.steampowered.com/IStoreBrowseService/GetItems/v1/?" + urllib.parse.urlencode({"input_json": json.dumps(req)})
+        try:
+            items = _json("Steam", lambda: fetch(url)).get("response", {}).get("store_items", [])
+        except RuntimeError:
+            continue
+        out |= {str(it["appid"]): it for it in items if it.get("appid")}
+    return out
+
+
+def steam_adult(appids, items=None):
+    """-> the appids Steam itself marks for nudity or sexual content."""
+    items = steam_items(appids) if items is None else items
+    return {a for a, it in items.items() if STEAM_SEXUAL & set(it.get("content_descriptorids") or [])}
 
 
 # ---------- music ----------
@@ -372,7 +384,8 @@ def novel_search(q):
         name = image.get("filename") or ""
         out.append({"kind": "novel", "site": "ranobedb", "key": str(s["id"]), "title": s.get("title") or s.get("romaji_orig") or s["title_orig"],
                     "year": _year(s.get("c_start_date")), "url": f"https://ranobedb.org/series/{s['id']}",
-                    "cover": f"https://images.ranobedb.org/{name}" if name else "", "nsfw": bool(image.get("nsfw"))})
+                    "cover": f"https://images.ranobedb.org/{name}" if name else "", "nsfw": bool(image.get("nsfw")),
+                    "alt": [x for x in (s.get("romaji"), s.get("romaji_orig"), s.get("title_orig")) if x]})
     return out
 
 

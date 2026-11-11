@@ -373,6 +373,94 @@ def test_imports(tmp):
     db.close()
 
 
+def bencode(v):
+    if isinstance(v, int):
+        return b"i%de" % v
+    if isinstance(v, (bytes, str)):
+        v = v.encode() if isinstance(v, str) else v
+        return b"%d:%s" % (len(v), v)
+    if isinstance(v, list):
+        return b"l" + b"".join(map(bencode, v)) + b"e"
+    return b"d" + b"".join(bencode(k) + bencode(x) for k, x in sorted(v.items())) + b"e"
+
+
+def test_scan(tmp):
+    """Names in, titles out; Steam's files, qBittorrent's resume data and plain folders read correctly."""
+    from . import scan
+    for name, kind, want in (("[SubsPlease] Sousou no Frieren - 01 (1080p) [ABCD1234].mkv", "anime", ("Sousou no Frieren", None, "")),
+                             ("[Judas] Mob Psycho 100 S3 - 05.mkv", "anime", ("Mob Psycho 100", None, "")),
+                             ("Dune.Part.Two.2024.2160p.WEB-DL.DDP5.1.x265-GROUP", "film", ("Dune Part Two", 2024, "")),
+                             ("Blade_Runner_2049_2017_1080p", "film", ("Blade Runner 2049", 2017, "")),
+                             ("2001 A Space Odyssey (1968)", "film", ("2001 A Space Odyssey", 1968, "")),
+                             ("Radiohead - OK Computer (1997) [FLAC]", "music", ("OK Computer", 1997, "Radiohead")),
+                             ("Hades.v1.38290-GOG", "game", ("Hades", None, "")), ("Persona 5 Royal-FLT", "game", ("Persona 5 Royal", None, "")),
+                             ("Berserk v01-41 (Dark Horse) [Digital]", "manga", ("Berserk", None, "")),
+                             ("[deanzel] Steins;Gate [BD 1080p Hi10p Dual Audio FLAC]", "anime", ("Steins;Gate", None, "")),
+                             ("[AV1ARY] New Game! (BD 1080p AV1 Opus)", "anime", ("New Game!", None, ""))):
+        assert scan.clean_title(name, kind) == want, (name, scan.clean_title(name, kind))
+    assert scan.guess_kind("[Grp] Show - 01", [("a.mkv", 9)]) == "anime" and scan.guess_kind("Heat 1995", [("heat.mkv", 9)]) == "film"
+    assert scan.guess_kind("Show", [(f"e{i}.mkv", 9) for i in range(5)]) == "anime" and scan.guess_kind("x", [("readme.txt", 1), ("a.flac", 99)]) == "music"
+    assert scan.guess_kind("x", [("notes.doc", 1)]) is None
+
+    # best match: same title and year beats the first hit; no exact title is a guess; a dated mismatch isn't exact
+    res = [{"title": "Dune", "year": 1984}, {"title": "Dune", "year": 2021}, {"title": "Dune: Part Two", "year": 2024}]
+    assert scan.best_match(res, "Dune", 2021) == (res[1], True) and scan.best_match(res, "dune", None) == (res[0], True)
+    assert scan.best_match(res, "Dune", 1999) == (res[0], False) and scan.best_match(res, "Arrival") == (res[0], False) and scan.best_match([], "x") == (None, False)
+    ani = [{"title": "The Elusive Samurai", "year": 2024, "alt": ["Nige Jouzu no Wakagimi", "逃げ上手の若君"]}, {"title": "Umamusume: Pretty Derby", "alt": []}]
+    assert scan.best_match(ani, "Nige Jouzu no Wakagimi") == (ani[0], True) and scan.best_match(ani, "Uma Musume Pretty Derby") == (ani[1], True)
+
+    # Steam: two libraries, a tool skipped, playtime and recency decide the status, uninstalled games only if Steam says game
+    root, lib2 = tmp / "steam", tmp / "games"
+    (root / "steamapps").mkdir(parents=True)
+    (lib2 / "steamapps").mkdir(parents=True)
+    (root / "steamapps/libraryfolders.vdf").write_text(f'"libraryfolders"\n{{ "0" {{ "path" "{root}" }} "1" {{ "path" "{lib2}" }} }}')
+    for lib, appid, name in ((root, 1145360, "Hades"), (root, 1493710, "Proton Experimental"), (lib2, 4000, "Garry's Mod"), (lib2, 5, "Unplayed")):
+        (lib / f"steamapps/appmanifest_{appid}.acf").write_text(f'"AppState" {{ "appid" "{appid}" "name" "{name}" }}')
+    conf = root / "userdata/1/config"
+    conf.mkdir(parents=True)
+    now = 1_800_000_000
+    (conf / "localconfig.vdf").write_text('"UserLocalConfigStore" { "Software" { "Valve" { "Steam" { "apps" { '
+                                          f'"1145360" {{ "Playtime" "600" "LastPlayed" "{now - 86400}" }} "4000" {{ "Playtime" "90" "LastPlayed" "{now - 90 * 86400}" }} '
+                                          '"777" { "Playtime" "30" } "778" { "Playtime" "50" } } } } } }')
+    asked = []
+
+    def lookup(ids):
+        asked.append(set(ids))
+        return {"777": {"name": "Played Then Removed", "type": 0, "content_descriptorids": [1, 5]}, "778": {"name": "A Soundtrack", "type": 6}}
+    got = {r["match"]["key"]: r["match"] for r in scan.scan_steam([root], lookup, now)}
+    assert set(got) == {"steam:1145360", "steam:4000", "steam:5", "steam:777"}, got.keys()
+    assert [got[k]["status"] for k in ("steam:1145360", "steam:4000", "steam:5", "steam:777")] == ["active", "done", "planned", "done"]
+    assert got["steam:1145360"]["detail"] == "10 h played" and got["steam:5"]["detail"] == "installed" and got["steam:777"]["nsfw"] and not got["steam:4000"]["nsfw"]
+    assert asked == [{"1145360", "4000", "5", "777", "778"}]
+
+    # qBittorrent: names and files from the .torrent, the category decides when set, a broken file is skipped
+    bt = tmp / "BT_backup"
+    bt.mkdir()
+    for h, info, extra in (("a", {"name": "[SubsPlease] Frieren - 01 (1080p).mkv", "length": 9}, {"completed_time": 5}),
+                           ("b", {"name": "[SubsPlease] Frieren - 02 (1080p).mkv", "length": 9}, {}),
+                           ("c", {"name": "Radiohead - OK Computer (1997) [FLAC]", "files": [{"path": ["01.flac"], "length": 9}, {"path": ["cover.jpg"], "length": 1}]}, {}),
+                           ("d", {"name": "Some Thing", "files": [{"path": ["x.mkv"], "length": 9}]}, {"qBt-category": "Movies"})):
+        (bt / f"{h}.fastresume").write_bytes(bencode({"qBt-name": "", **extra}))
+        (bt / f"{h}.torrent").write_bytes(bencode({"info": info}))
+    (bt / "e.fastresume").write_bytes(b"d4:name")
+    rows = {r["title"]: r for r in scan.scan_qbittorrent([bt])}
+    assert set(rows) == {"Frieren", "OK Computer", "Some Thing"}, rows.keys()
+    assert rows["Frieren"]["kind"] == "anime" and rows["Frieren"]["count"] == 2 and rows["Frieren"]["done"]
+    assert rows["OK Computer"]["kind"] == "music" and rows["OK Computer"]["creator"] == "Radiohead" and rows["Some Thing"]["kind"] == "film"
+    rejected(lambda: scan.bdecode(b"5:ab"), "bad string")
+
+    # a folder: one work per top-level entry; hidden and media-less entries skipped
+    media = tmp / "media"
+    (media / "Heat (1995)").mkdir(parents=True)
+    (media / "Heat (1995)/heat.mkv").write_bytes(b"x" * 9)
+    (media / ".hidden").mkdir()
+    (media / ".hidden/a.mkv").write_bytes(b"x")
+    (media / "Docs").mkdir()
+    (media / "Docs/a.doc").write_bytes(b"x")
+    (media / "Overlord v01-16.epub").write_bytes(b"x")
+    assert [(r["title"], r["kind"], r["year"]) for r in scan.scan_folder(media)] == [("Heat", "film", 1995), ("Overlord", "novel", None)]
+
+
 def test_launcher(tmp):
     """The launcher: a clone fast-forwards and keeps local edits; without .git a download is installed only if it compiles.
     Importing it must never install anything: this runs on a Python without Qt."""
@@ -441,5 +529,6 @@ def selftest():
         test_sources()
         test_imports(tmp)
         test_adult(tmp)
+        test_scan(tmp)
         test_launcher(tmp)
     print("selftest ok")

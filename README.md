@@ -47,6 +47,18 @@ Search in a tab and press Enter, pick a result, and fill in the log form. **Add 
 - **Letterboxd export:** Settings → Data → Export your data. Import the zip as is.
 - **RateYourMusic export:** your profile page → Export your data. Save it as a `.csv`.
 
+## Scan for media
+
+**Scan for media…** finds what you already have:
+
+- **Steam library:** every installed game in all your library folders, plus games you played and later uninstalled, read from Steam's own files. Played in the last two weeks comes in as Playing, played before as Played, never launched as Planned. Steam IDs are exact, so nothing needs matching.
+- **qBittorrent:** every torrent qBittorrent knows, read from its saved state. A category like "Anime" or "Movies" decides the kind; otherwise the file types do (videos, audio, e-books, comics, games).
+- **Choose a folder…:** each file or folder at the top of it is one work, guessed the same way.
+
+Release names are cleaned up ("[SubsPlease] Sousou no Frieren - 01 (1080p)" becomes "Sousou no Frieren"), and episodes of the same show become one row. Fix any title or kind in the table, then press **Find matches** to look each one up on its site. Exact matches, including romaji names against English titles, are checked for you; closest guesses are left for you to check. **Add checked…** shows the same preview as a sync before anything is added.
+
+Scanning only reads files on your computer. Titles are sent to the sites only when you press Find matches.
+
 ## Profiles
 
 Each profile is a separate log, picked from the toolbar. **Export…** writes one portable JSON file holding all entries, ratings, notes and site usernames, readable only by you. **Import…** reads one back as a new profile, or merges it into the current one with the newest version of each entry winning. Neither choice removes anything.

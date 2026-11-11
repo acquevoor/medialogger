@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComb
                                QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
                                QPlainTextEdit, QPushButton, QSpinBox, QSplitter, QStyle, QStyledItemDelegate, QTableWidget, QTableWidgetItem, QTabWidget, QToolBar, QVBoxLayout, QWidget)
 
-from . import imports, sources, store
+from . import imports, scan, sources, store
 
 log = logging.getLogger("medialogger")
 ACTIVE = {"game": "Playing", "anime": "Watching", "manga": "Reading", "music": "Listening", "film": "Watching", "novel": "Reading", "vn": "Reading"}
@@ -364,6 +364,210 @@ class SyncDialog(QDialog):
             self.main.refresh()
 
 
+class ScanDialog(QDialog):
+    """What you already have: Steam (exact ids and playtime), qBittorrent's torrents, or any folder (one work per
+    top-level entry). Torrents and folders are guesses from file types and names: fix the title or kind, Find matches
+    looks each up on its site, then Add checked goes through the same preview as a sync."""
+    COLS = ("", "Found", "Title", "Kind", "Match")
+
+    def __init__(self, main):
+        super().__init__(main)
+        self.main, self.rows, self.alive, self.matching = main, [], True, False
+        self.setWindowTitle("Scan for media")
+        self.resize(1100, 680)
+        box = QVBoxLayout(self)
+        top = QHBoxLayout()
+        for text, fn in (("Steam library", lambda: self.scan("Steam", scan.scan_steam)), ("qBittorrent", lambda: self.scan("qBittorrent", scan.scan_qbittorrent)),
+                         ("Choose a folder…", self.pick_folder)):
+            b = QPushButton(text)
+            b.clicked.connect(fn)
+            top.addWidget(b)
+        top.addStretch(1)
+        box.addLayout(top)
+        self.table = QTableWidget(0, len(self.COLS))
+        self.table.setHorizontalHeaderLabels(self.COLS)
+        self.table.verticalHeader().hide()
+        head = self.table.horizontalHeader()
+        for col, mode in ((0, QHeaderView.ResizeToContents), (1, QHeaderView.Stretch), (2, QHeaderView.Stretch), (3, QHeaderView.ResizeToContents), (4, QHeaderView.Stretch)):
+            head.setSectionResizeMode(col, mode)
+        self.table.cellChanged.connect(self.edited)
+        box.addWidget(self.table, 1)
+        self.state = QLabel("Pick what to scan. Names go to the sites only when you press Find matches.", textFormat=Qt.PlainText)
+        box.addWidget(self.state)
+        bottom = QHBoxLayout()
+        self.match_btn, self.stop_btn, self.add_btn = QPushButton("Find matches"), QPushButton("Stop"), QPushButton("Add checked…")
+        self.match_btn.clicked.connect(self.find_matches)
+        self.stop_btn.clicked.connect(lambda: setattr(self, "matching", False))
+        self.add_btn.clicked.connect(self.add)
+        self.status = QComboBox()
+        for st in store.STATUSES:
+            self.status.addItem(st.capitalize(), st)
+        bottom.addWidget(self.match_btn)
+        bottom.addWidget(self.stop_btn)
+        bottom.addStretch(1)
+        bottom.addWidget(QLabel("Add as (Steam keeps its playtime status):"))
+        bottom.addWidget(self.status)
+        bottom.addWidget(self.add_btn)
+        box.addLayout(bottom)
+        self.buttons()
+
+    def buttons(self):
+        for b in self.findChildren(QPushButton):
+            b.setEnabled(not self.matching)
+        self.stop_btn.setEnabled(self.matching)
+        self.match_btn.setEnabled(not self.matching and any(not r.get("match") for r in self.rows))
+        self.add_btn.setEnabled(not self.matching and bool(self.rows))
+
+    def pick_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Folder to scan", str(Path.home()))
+        if folder:
+            self.scan(folder, lambda: scan.scan_folder(folder))
+
+    def scan(self, what, fn):
+        self.state.setText(f"Scanning {what}…")
+        run(fn, lambda rows, err: self.scanned(what, rows, err))
+
+    def scanned(self, what, rows, err):
+        if not self.alive:
+            return
+        if err:
+            show_error(self, "Scan failed", err)
+            self.state.setText("")
+            return
+        self.rows = rows
+        self.fill()
+        self.state.setText(f"{what}: {len(rows)} found." + ("" if not rows or rows[0].get("steam") else " Check the titles, then Find matches."))
+        self.buttons()
+
+    def match_text(self, r):
+        m = r.get("match")
+        if r.get("steam"):
+            return f"Steam · {m['detail']}"
+        if not m:
+            return "no match yet" if "match" not in r else "nothing found: added as you typed it"
+        return ("" if r.get("exact") else "closest, check it: ") + m["title"] + (f" ({m['year']})" if m.get("year") else "") + (f" · {m['creator']}" if m.get("creator") else "")
+
+    def fill(self):
+        t = self.table
+        t.blockSignals(True)
+        t.setRowCount(len(self.rows))
+        for y, r in enumerate(self.rows):
+            check = QTableWidgetItem()
+            check.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+            check.setCheckState(Qt.Checked if r.get("steam") or r.get("exact") else Qt.Unchecked)
+            t.setItem(y, 0, check)
+            found = QTableWidgetItem(r["found"] + (f"  ×{r['count']}" if r.get("count", 1) > 1 else ""))
+            found.setFlags(Qt.ItemIsEnabled)
+            found.setToolTip(r["found"])
+            t.setItem(y, 1, found)
+            title = QTableWidgetItem(r["title"])
+            if r.get("steam"):
+                title.setFlags(Qt.ItemIsEnabled)
+            t.setItem(y, 2, title)
+            kind = QComboBox()
+            for k, label in store.KINDS.items():
+                kind.addItem(label, k)
+            kind.setCurrentIndex(list(store.KINDS).index(r["kind"]))
+            kind.setEnabled(not r.get("steam"))
+            kind.currentIndexChanged.connect(lambda _, y=y, w=kind: self.rekind(y, w.currentData()))
+            t.setCellWidget(y, 3, kind)
+            match = QTableWidgetItem(self.match_text(r))
+            match.setFlags(Qt.ItemIsEnabled)
+            t.setItem(y, 4, match)
+        t.blockSignals(False)
+
+    def unmatch(self, y):
+        r = self.rows[y]
+        r.pop("match", None)
+        r.pop("exact", None)
+        self.table.blockSignals(True)
+        self.table.item(y, 4).setText(self.match_text(r))
+        self.table.item(y, 0).setCheckState(Qt.Unchecked)
+        self.table.blockSignals(False)
+        self.buttons()
+
+    def edited(self, y, x):
+        if x == 2 and not self.rows[y].get("steam"):
+            self.rows[y]["title"] = self.table.item(y, 2).text().strip()
+            self.unmatch(y)
+
+    def rekind(self, y, kind):
+        self.rows[y]["kind"] = kind
+        self.unmatch(y)
+
+    def find_matches(self):
+        todo = [y for y, r in enumerate(self.rows) if "match" not in r]
+        self.matching = True
+        self.buttons()
+        self.next_match(todo, 0)
+
+    def next_match(self, todo, done):
+        if not self.alive:
+            return
+        if not self.matching or done == len(todo):
+            self.matching = False
+            self.state.setText(f"Matched {done} of {len(todo)}. Exact matches are checked; check the closest ones yourself.")
+            self.buttons()
+            return
+        y = todo[done]
+        r = dict(self.rows[y])
+        self.state.setText(f"Matching {done + 1} of {len(todo)}: {r['title']}")
+        run(lambda: scan.find_match(r), lambda res, err: self.matched(todo, done, y, r, res, err))
+
+    def matched(self, todo, done, y, asked, res, err):
+        if not self.alive:
+            return
+        r = self.rows[y]
+        if (r["title"], r["kind"]) == (asked["title"], asked["kind"]):  # not edited while the search ran
+            if err:
+                r.pop("match", None)  # a failed search stays "no match yet", so the next Find matches retries it
+                r["exact"] = False
+            else:
+                r["match"], r["exact"] = res
+            self.table.blockSignals(True)
+            self.table.item(y, 4).setText(self.match_text(r) if not err else f"search failed: {err}")
+            if r["exact"]:
+                self.table.item(y, 0).setCheckState(Qt.Checked)
+            self.table.blockSignals(False)
+        self.next_match(todo, done + 1)
+
+    def picked(self):
+        """Checked rows -> log rows: the site's own entry when matched, else the title as typed."""
+        out, status = [], self.status.currentData()
+        for y, r in enumerate(self.rows):
+            if self.table.item(y, 0).checkState() != Qt.Checked:
+                continue
+            m = r.get("match")
+            if m:
+                out.append({**m, "status": m.get("status", status) if r.get("steam") else status})
+            elif r["title"]:
+                kind = r["kind"]
+                out.append({"kind": kind, "site": store.SITE_OF[kind] if kind in MANUAL_SHARED else "manual", "key": store.make_key(kind, r["title"], r.get("year"), r.get("creator", "")),
+                            "title": r["title"], "year": r.get("year"), "creator": r.get("creator", ""), "status": status})
+        return out
+
+    def add(self):
+        rows = self.picked()
+        if not rows:
+            self.state.setText("Nothing checked.")
+            return
+        try:
+            d = store.diff(self.main.db, rows)
+        except ValueError as e:
+            show_error(self, "Can't add", e)
+            return
+        if not d["new"] and not d["update"]:
+            self.state.setText("Nothing new: " + store.summary(d))
+        elif confirm(self, "Add to your log?", store.summary(d), "Add"):
+            store.apply(self.main.db, d)
+            self.state.setText("Added: " + store.summary(d))
+            self.main.refresh()
+
+    def done(self, code):
+        self.alive = self.matching = False
+        super().done(code)
+
+
 # ---------- the tabs ----------
 
 KIND_ONE = {"game": "game", "anime": "anime", "manga": "manga", "music": "album", "film": "film", "novel": "light novel", "vn": "visual novel"}
@@ -598,6 +802,9 @@ class Main(QMainWindow):
         sync = QAction("Sync from sites…", self)
         sync.triggered.connect(lambda: SyncDialog(self).exec())
         bar.addAction(sync)
+        scan_act = QAction("Scan for media…", self)
+        scan_act.triggered.connect(lambda: ScanDialog(self).exec())
+        bar.addAction(scan_act)
 
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
