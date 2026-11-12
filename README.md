@@ -50,6 +50,10 @@ To log something, type in the search box and press Enter. With several kinds sho
 - **Letterboxd export:** Settings → Data → Export your data. Import the zip as is.
 - **RateYourMusic export:** your profile page → Export your data. Save it as a `.csv`.
 
+## Grid creator
+
+The **Grid creator** tab makes a chart of square covers from your log, up to 20×20. Set the columns and rows, then double-click entries in the list on the left to fill the cells in order, or drag one onto a cell. Drag a cell onto another to swap them; right-click or Delete empties one. **Names on the right** lists each row's names beside it. **Export image…** saves a PNG at the cell size you pick (300 px makes a 3×3 grid 900 px square). Adult covers stay blurred in the export unless **Show adult covers** is ticked. The grid is kept per profile.
+
 ## Scan for media
 
 **Scan for media…** finds what you already have:

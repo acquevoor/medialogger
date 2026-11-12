@@ -1,5 +1,6 @@
 """The window. SQLite stays on the UI thread; workers only fetch and parse, then hand plain rows back."""
 import hashlib
+import json
 import logging
 import os
 import platform
@@ -10,10 +11,10 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QRect, QSize, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QFontMetrics, QKeySequence, QPainter, QPixmap, QShortcut
+from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QFontMetrics, QImage, QKeySequence, QPainter, QPen, QPixmap, QShortcut
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout,
                                QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
-                               QPlainTextEdit, QPushButton, QSpinBox, QSplitter, QStackedWidget, QStyle, QStyledItemDelegate, QTableWidget, QTableWidgetItem, QToolBar, QVBoxLayout, QWidget)
+                               QPlainTextEdit, QPushButton, QSpinBox, QSplitter, QStackedWidget, QStyle, QStyledItemDelegate, QTableWidget, QTableWidgetItem, QTabWidget, QToolBar, QVBoxLayout, QWidget)
 
 from . import imports, scan, sources, store
 
@@ -961,6 +962,304 @@ class Home(QWidget):
             self.reload()
 
 
+# ---------- grid creator ----------
+
+GRID_MAX, GRID_PIX = 20, 400  # cells per side; covers are kept cropped to this many pixels square
+
+
+def square(pix):
+    """The middle square of a cover, at most GRID_PIX wide."""
+    side = min(pix.width(), pix.height())
+    sq = pix.copy((pix.width() - side) // 2, (pix.height() - side) // 2, side, side)
+    return sq.scaled(GRID_PIX, GRID_PIX, Qt.KeepAspectRatio, Qt.SmoothTransformation) if side > GRID_PIX else sq
+
+
+def grid_name(e):
+    return f"{e['creator']} – {e['title']}" if e["kind"] == "music" and e["creator"] else e["title"]
+
+
+class GridCanvas(QWidget):
+    """Paints the grid scaled to fit; the export paints the same thing at full size. Click a cell to pick it,
+    drag one cell onto another to swap them, drop a log entry from the list onto a cell, Delete or right-click clears."""
+    BASE = 100  # cell size the screen layout is computed at, before scaling to the widget
+
+    def __init__(self, tab):
+        super().__init__()
+        self.tab, self.sel, self.press = tab, 0, None
+        self.setAcceptDrops(True)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setMinimumSize(300, 300)
+
+    def geometry_(self):
+        w, h = self.tab.size_at(self.BASE)
+        s = min(self.width() / w, self.height() / h)
+        return s, (self.width() - w * s) / 2, (self.height() - h * s) / 2
+
+    def cell_at(self, pos):
+        s, ox, oy = self.geometry_()
+        x, y = int((pos.x() - ox) / s // self.BASE), int((pos.y() - oy) / s // self.BASE)
+        t = self.tab
+        return y * t.cols.value() + x if 0 <= x < t.cols.value() and 0 <= y < t.rows.value() else None
+
+    def paintEvent(self, ev):
+        p = QPainter(self)
+        p.fillRect(self.rect(), self.palette().window())
+        s, ox, oy = self.geometry_()
+        p.translate(ox, oy)
+        p.scale(s, s)
+        self.tab.render(p, self.BASE, self.sel)
+        p.end()
+
+    def mousePressEvent(self, ev):
+        i = self.cell_at(ev.position())
+        if i is None:
+            return
+        if ev.button() == Qt.RightButton:
+            self.tab.put(i, None)
+        else:
+            self.sel, self.press = i, i
+        self.update()
+
+    def mouseReleaseEvent(self, ev):
+        i = self.cell_at(ev.position())
+        if self.press is not None and i is not None and i != self.press:
+            self.tab.swap(self.press, i)
+            self.sel = i
+        self.press = None
+        self.update()
+
+    def keyPressEvent(self, ev):
+        if ev.key() in (Qt.Key_Delete, Qt.Key_Backspace):
+            self.tab.put(self.sel, None)
+        else:
+            super().keyPressEvent(ev)
+
+    def dragEnterEvent(self, ev):
+        if ev.source() is self.tab.picker:
+            ev.acceptProposedAction()
+
+    dragMoveEvent = dragEnterEvent
+
+    def dropEvent(self, ev):
+        i, item = self.cell_at(ev.position()), self.tab.picker.currentItem()
+        if i is not None and item:
+            self.sel = i
+            self.tab.put(i, item.data(ID_ROLE))
+
+
+class GridTab(QWidget):
+    """A chart of covers, up to 20×20, square tiles, optional names on the right, saved as a PNG.
+    The layout is kept per profile (settings table, not in exported profiles: entry ids are local)."""
+
+    def __init__(self, main):
+        super().__init__()
+        self.main, self.cells, self.by_id = main, [], {}
+        self.pix, self.blurred = {}, {}  # cover url -> square pixmap (None: failed / asked); -> its blurred twin
+        box = QHBoxLayout(self)
+
+        left = QVBoxLayout()
+        self.find = QLineEdit(placeholderText="Filter your log")
+        self.find.textChanged.connect(self.fill_picker)
+        self.picker = QListWidget()
+        self.picker.setDragEnabled(True)
+        self.picker.setDragDropMode(QAbstractItemView.DragOnly)
+        self.picker.itemActivated.connect(self.place)
+        left.addWidget(self.find)
+        left.addWidget(self.picker, 1)
+        left.addWidget(QLabel("Double-click to fill the selected cell, or drag onto a cell.", wordWrap=True, textFormat=Qt.PlainText))
+        side = QWidget()
+        side.setLayout(left)
+        side.setMaximumWidth(320)
+        box.addWidget(side)
+
+        right = QVBoxLayout()
+        bar = QHBoxLayout()
+        self.cols, self.rows = QSpinBox(minimum=1, maximum=GRID_MAX, value=3), QSpinBox(minimum=1, maximum=GRID_MAX, value=3)
+        self.names = QCheckBox("Names on the right")
+        self.show_adult = QCheckBox("Show adult covers")
+        self.cell_px = QSpinBox(minimum=50, maximum=GRID_PIX, value=300, suffix=" px", singleStep=50)
+        export, clear = QPushButton("Export image…"), QPushButton("Clear")
+        bar.addWidget(QLabel("Columns"))
+        bar.addWidget(self.cols)
+        bar.addWidget(QLabel("Rows"))
+        bar.addWidget(self.rows)
+        bar.addWidget(self.names)
+        bar.addWidget(self.show_adult)
+        bar.addStretch(1)
+        bar.addWidget(clear)
+        bar.addWidget(QLabel("Cell"))
+        bar.addWidget(self.cell_px)
+        bar.addWidget(export)
+        right.addLayout(bar)
+        self.canvas = GridCanvas(self)
+        right.addWidget(self.canvas, 1)
+        right.addWidget(QLabel("Drag a cell onto another to swap them. Right-click or Delete empties a cell.", textFormat=Qt.PlainText))
+        box.addLayout(right, 1)
+
+        for w in (self.cols, self.rows):
+            w.valueChanged.connect(self.resized)
+        self.names.toggled.connect(self.changed)
+        self.show_adult.toggled.connect(self.canvas.update)
+        clear.clicked.connect(self.clear)
+        export.clicked.connect(self.export)
+
+    # ----- data -----
+
+    def reload(self):
+        """From the current profile: the log for the picker, the saved layout for the grid."""
+        self.by_id = {e["id"]: e for e in store.entries(self.main.db)}
+        try:
+            saved = json.loads(store.get_setting(self.main.db, "grid") or "{}")
+            cols, rows, names, cells = int(saved.get("cols", 3)), int(saved.get("rows", 3)), bool(saved.get("names")), list(saved.get("cells", []))
+        except (ValueError, TypeError, AttributeError):
+            cols, rows, names, cells = 3, 3, False, []
+        for w, v in ((self.cols, cols), (self.rows, rows), (self.names, names)):
+            w.blockSignals(True)
+            w.setValue(v) if isinstance(w, QSpinBox) else w.setChecked(v)
+            w.blockSignals(False)
+        self.cells = [c if c in self.by_id else None for c in cells]
+        self.resized()
+        self.fill_picker()
+
+    def fill_picker(self, *_):
+        needle = self.find.text().casefold()
+        self.picker.clear()
+        for e in sorted(self.by_id.values(), key=lambda e: e["title"].casefold()):
+            if needle in f"{e['title']} {e['creator']}".casefold():
+                item = QListWidgetItem(f"● {grid_name(e)}")
+                item.setForeground(QColor(KIND_COLOR[e["kind"]]))
+                item.setToolTip(store.KINDS[e["kind"]])
+                item.setData(ID_ROLE, e["id"])
+                self.picker.addItem(item)
+
+    def resized(self, *_):
+        n = self.cols.value() * self.rows.value()
+        self.cells = (self.cells + [None] * n)[:n]  # ponytail: cells reflow in reading order; extra ones past the end are dropped
+        self.canvas.sel = min(self.canvas.sel, n - 1)
+        self.changed()
+
+    def changed(self, *_):
+        store.set_setting(self.main.db, "grid", json.dumps({"cols": self.cols.value(), "rows": self.rows.value(), "names": self.names.isChecked(), "cells": self.cells}))
+        for c in self.cells:
+            e = self.by_id.get(c)
+            if e and e["cover"] and e["cover"] not in self.pix:
+                url = e["cover"]
+                self.pix[url] = None
+                run(lambda url=url: load_cover(url), lambda path, err, url=url: self.got_cover(url, path, err))
+        self.canvas.update()
+
+    def got_cover(self, url, path, err):
+        pix = None if err else QPixmap(str(path))
+        if pix and not pix.isNull():
+            self.pix[url] = square(pix)
+            self.canvas.update()
+
+    def put(self, i, entry_id):
+        self.cells[i] = entry_id
+        if entry_id is not None:  # move on to the next empty cell, so double-clicks fill the grid in order
+            empty = [j for j in range(len(self.cells)) if self.cells[j] is None]
+            self.canvas.sel = next((j for j in empty if j > i), empty[0] if empty else i)
+        self.changed()
+
+    def place(self, item):
+        self.put(self.canvas.sel, item.data(ID_ROLE))
+
+    def swap(self, a, b):
+        self.cells[a], self.cells[b] = self.cells[b], self.cells[a]
+        self.changed()
+
+    def clear(self):
+        if any(self.cells) and confirm(self, "Clear the grid?", "Empty every cell?", "Clear"):
+            self.cells = [None] * len(self.cells)
+            self.canvas.sel = 0
+            self.changed()
+
+    # ----- drawing: the screen and the export share this -----
+
+    def name_lines(self):
+        """One block per row: the names in it, top to bottom."""
+        cols = self.cols.value()
+        return [[grid_name(self.by_id[c]) for c in self.cells[r * cols:(r + 1) * cols] if c in self.by_id] for r in range(self.rows.value())]
+
+    def name_font(self, cell):
+        lines = self.name_lines()
+        n = sum(map(len, lines)) + len(lines)  # a blank line between rows
+        f = QFont(self.font())
+        f.setPixelSize(max(6, int(min(cell * 0.16, self.rows.value() * cell / max(n, 1) / 1.2))))
+        return f, lines
+
+    def size_at(self, cell):
+        w, h = self.cols.value() * cell, self.rows.value() * cell
+        if self.names.isChecked():
+            f, lines = self.name_font(cell)
+            fm = QFontMetrics(f)
+            widest = max((fm.horizontalAdvance(t) for block in lines for t in block), default=0)
+            w += min(widest, cell * 6) + cell // 2  # ponytail: very long names are cut at six cells wide. The slack: text measures wider scaled down on screen
+        return w, h
+
+    def render(self, p, cell, sel=None):
+        cols = self.cols.value()
+        w, h = self.size_at(cell)
+        p.fillRect(QRect(0, 0, w, h), QColor("black"))
+        p.setRenderHint(QPainter.SmoothPixmapTransform)
+        gap = max(1, cell // 50)
+        for i, c in enumerate(self.cells):
+            box = QRect(i % cols * cell + gap, i // cols * cell + gap, cell - 2 * gap, cell - 2 * gap)
+            e = self.by_id.get(c)
+            pix = self.pix.get(e["cover"]) if e and e["cover"] else None
+            if pix:
+                if store.adult(e) and not self.show_adult.isChecked():
+                    pix = self.blurred.setdefault(e["cover"], blur(pix))
+                p.drawPixmap(box, pix)
+                if pix is self.blurred.get(e["cover"]):
+                    p.save()
+                    f = QFont(self.font())
+                    f.setPixelSize(max(6, cell // 8))
+                    p.setFont(f)
+                    badge(p, box)
+                    p.restore()
+            else:
+                p.fillRect(box, QColor("#202020"))
+                if e:  # no cover (yet): the name, so the cell isn't a mystery
+                    f = QFont(self.font())
+                    f.setPixelSize(max(6, cell // 9))
+                    p.setFont(f)
+                    p.setPen(QColor("#cccccc"))
+                    p.drawText(box.adjusted(4, 4, -4, -4), Qt.AlignCenter | Qt.TextWordWrap, grid_name(e))
+            if sel == i:
+                p.setPen(QPen(self.palette().highlight().color(), max(2, cell // 25)))
+                p.setBrush(Qt.NoBrush)
+                p.drawRect(box)
+        if self.names.isChecked():
+            f, lines = self.name_font(cell)
+            fm = QFontMetrics(f)
+            p.setFont(f)
+            p.setPen(QColor("white"))
+            x, y, room = cols * cell + cell // 6, 0, w - cols * cell - cell // 3
+            for r, block in enumerate(lines):
+                y = max(y, r * cell)  # each row's names start level with that row, unless the row above ran long
+                for t in block:
+                    p.drawText(QRect(x, y, room, fm.height()), Qt.AlignLeft | Qt.AlignVCenter, fm.elidedText(t, Qt.ElideRight, room))
+                    y += fm.height()
+                y += fm.height() // 2
+
+    def export(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Export grid", str(Path.home() / f"{self.main.profile}-grid.png"), "PNG image (*.png)")
+        if not path:
+            return
+        if not path.lower().endswith(".png"):
+            path += ".png"
+        cell = self.cell_px.value()
+        img = QImage(*self.size_at(cell), QImage.Format_RGB32)
+        p = QPainter(img)
+        self.render(p, cell)
+        p.end()
+        if img.save(path):
+            self.main.statusBar().showMessage(f"Saved {img.width()}×{img.height()} grid to {path}")
+        else:
+            show_error(self, "Export failed", f"Couldn't write {path}")
+
+
 # ---------- main window ----------
 
 class Main(QMainWindow):
@@ -991,8 +1290,12 @@ class Main(QMainWindow):
         scan_act.triggered.connect(lambda: ScanDialog(self).exec())
         bar.addAction(scan_act)
 
-        self.home = Home(self)
-        self.setCentralWidget(self.home)
+        self.home, self.grid = Home(self), GridTab(self)
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self.home, "Home")
+        self.tabs.addTab(self.grid, "Grid creator")
+        self.tabs.currentChanged.connect(self.refresh)
+        self.setCentralWidget(self.tabs)
         QShortcut(QKeySequence("Ctrl+F"), self, lambda: self.home.filter.setFocus())
         self.load_profiles()
         self.refresh()
@@ -1003,7 +1306,7 @@ class Main(QMainWindow):
         self.combo.setCurrentText(self.profile)
 
     def refresh(self, *_):
-        self.home.reload()
+        self.tabs.currentWidget().reload()
 
     def show_stats(self):
         if hasattr(self, "home"):  # the first fill runs while Home is still being built
