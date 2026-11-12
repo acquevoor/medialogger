@@ -11,9 +11,9 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, QRect, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QFontMetrics, QKeySequence, QPainter, QPixmap, QShortcut
-from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout,
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout,
                                QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
-                               QPlainTextEdit, QPushButton, QSpinBox, QSplitter, QStyle, QStyledItemDelegate, QTableWidget, QTableWidgetItem, QTabWidget, QToolBar, QVBoxLayout, QWidget)
+                               QPlainTextEdit, QPushButton, QSpinBox, QSplitter, QStackedWidget, QStyle, QStyledItemDelegate, QTableWidget, QTableWidgetItem, QToolBar, QVBoxLayout, QWidget)
 
 from . import imports, scan, sources, store
 
@@ -193,6 +193,8 @@ class Tile(QStyledItemDelegate):
             p.save()
             badge(p, box)
             p.restore()
+        if index.data(KIND_ROLE):  # the home grid: a strip in the kind's color
+            p.fillRect(QRect(box.left(), box.top(), TILE_W, 5), QColor(index.data(KIND_ROLE)))
         title, meta, detail = index.data(LINES_ROLE)
         y, w = box.bottom() + 6, r.width() - 2 * self.PAD
         bold = QFont(option.font)
@@ -568,55 +570,110 @@ class ScanDialog(QDialog):
         super().done(code)
 
 
-# ---------- the tabs ----------
+# ---------- the home page ----------
 
 KIND_ONE = {"game": "game", "anime": "anime", "manga": "manga", "music": "album", "film": "film", "novel": "light novel", "vn": "visual novel"}
-COLUMNS = ("Title", "Creator", "Year", "Status", "Rating", "Finished")
+KIND_COLOR = {"game": "#2e9e5b", "anime": "#3b7dd8", "manga": "#8e5bd0", "music": "#e08a1e", "film": "#d64545", "novel": "#1f9e9e", "vn": "#d44d9a"}
+COLUMNS = ("Type", "Title", "Creator", "Year", "Status", "Rating", "Finished")
+ID_ROLE, KIND_ROLE = Qt.UserRole + 4, Qt.UserRole + 5
 
 
-class Tab(QWidget):
-    def __init__(self, main, kind):
+def chip_style(color):
+    return (f"QPushButton {{ border: 2px solid {color}; border-radius: 13px; padding: 4px 12px; }}"
+            f"QPushButton:checked {{ background: {color}; color: white; font-weight: bold; }}")
+
+
+class Home(QWidget):
+    """Every kind on one page: the colored chips pick which kinds show, the List/Grid buttons how."""
+
+    def __init__(self, main):
         super().__init__()
-        self.main, self.kind = main, kind
+        self.main, conf = main, main.conf
         self.rows, self.current, self.search_id = [], None, 0
+        self.revealed, self.cover_pix = set(), None  # entries whose adult cover you clicked open, this session
+        self.pix, self.tiles = {}, {}  # cover url -> scaled pixmap (None: failed); entry id -> grid item
         box = QVBoxLayout(self)
+
+        chips = QHBoxLayout()
+        self.chips = {}
+        shown = set(conf.get("kinds") or store.KINDS) & set(store.KINDS)
+        for kind, label in store.KINDS.items():
+            b = QPushButton(label, checkable=True, checked=kind in shown)
+            b.setStyleSheet(chip_style(KIND_COLOR[kind]))
+            b.toggled.connect(self.kinds_changed)
+            b.setContextMenuPolicy(Qt.CustomContextMenu)
+            b.customContextMenuRequested.connect(lambda _, k=kind: self.only(k))
+            b.setToolTip(f"Show or hide {label.lower()}. Right-click: only {label.lower()}.")
+            self.chips[kind] = b
+            chips.addWidget(b)
+        every = QPushButton("All")
+        every.clicked.connect(lambda: self.only(None))
+        chips.addWidget(every)
+        chips.addStretch(1)
+        self.list_btn, self.grid_btn = QPushButton("☰ List", checkable=True), QPushButton("▦ Grid", checkable=True)
+        views = QButtonGroup(self)
+        for b in (self.list_btn, self.grid_btn):
+            views.addButton(b)
+            chips.addWidget(b)
+        (self.grid_btn if conf.get("view") == "grid" else self.list_btn).setChecked(True)
+        views.buttonToggled.connect(lambda b, on: on and self.view_changed())
+        box.addLayout(chips)
+
         top = QHBoxLayout()
-        if kind:
-            self.search = QLineEdit(placeholderText=f"Search {SITE_NAME[kind]}, press Enter")
-            self.search.returnPressed.connect(self.do_search)
-            add = QPushButton("Add by hand…")
-            add.clicked.connect(lambda: self.log_row({"kind": kind}))
-            top.addWidget(self.search, 2)
-            top.addWidget(add)
-        self.filter = QLineEdit(placeholderText="Filter this log")
+        self.search_kind = QComboBox()
+        for kind, label in store.KINDS.items():
+            self.search_kind.addItem(label, kind)
+        self.search_kind.currentIndexChanged.connect(self.search_kind_changed)
+        self.search = QLineEdit()
+        self.search.returnPressed.connect(self.do_search)
+        add = QPushButton("Add by hand…")
+        add.clicked.connect(lambda: self.log_row({"kind": self.search_kind.currentData()}))
+        self.filter = QLineEdit(placeholderText="Filter your log")
         self.filter.textChanged.connect(self.fill)
         self.status = QComboBox()
         self.status.addItem("All statuses", "")
         for s in store.STATUSES:
-            self.status.addItem(status_label(kind, s) if kind else s.capitalize(), s)
+            self.status.addItem(s.capitalize(), s)
         self.status.currentIndexChanged.connect(self.fill)
+        self.show_adult = QCheckBox("Show adult covers")
+        self.show_adult.toggled.connect(self.reveal_all)
+        top.addWidget(self.search_kind)
+        top.addWidget(self.search, 2)
+        top.addWidget(add)
         top.addWidget(self.filter, 1)
         top.addWidget(self.status)
+        top.addWidget(self.show_adult)
         box.addLayout(top)
 
-        cols = COLUMNS if kind else ("Type", *COLUMNS)
-        self.table = QTableWidget(0, len(cols))
-        self.table.setHorizontalHeaderLabels(cols)
+        self.table = QTableWidget(0, len(COLUMNS))
+        self.table.setHorizontalHeaderLabels(COLUMNS)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.verticalHeader().hide()
         self.table.setSortingEnabled(True)
-        self.title_col = cols.index("Title")
+        self.title_col = COLUMNS.index("Title")
         self.table.horizontalHeader().setSectionResizeMode(self.title_col, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.table.itemSelectionChanged.connect(self.selected)
         self.table.cellDoubleClicked.connect(lambda *_: self.edit())
+        self.grid = QListWidget()
+        self.grid.setViewMode(QListWidget.IconMode)
+        self.grid.setResizeMode(QListWidget.Adjust)
+        self.grid.setMovement(QListWidget.Static)
+        self.grid.setUniformItemSizes(True)
+        self.grid.setSpacing(4)
+        self.grid.setItemDelegate(Tile(self.grid))
+        self.grid.itemSelectionChanged.connect(self.selected)
+        self.grid.itemActivated.connect(lambda *_: self.edit())
+        self.views = QStackedWidget()
+        self.views.addWidget(self.table)
+        self.views.addWidget(self.grid)
 
         pane = QWidget()
         side = QVBoxLayout(pane)
         self.cover = QLabel(alignment=Qt.AlignCenter, minimumHeight=240)
         self.cover.mousePressEvent = lambda _: self.reveal_cover()
-        self.revealed, self.cover_pix = set(), None  # entries whose adult cover you clicked open, this session
         self.heading = QLabel(textFormat=Qt.PlainText, wordWrap=True)
         self.heading.setStyleSheet("font-weight: bold")
         self.meta = QLabel(textFormat=Qt.PlainText, wordWrap=True)
@@ -634,48 +691,133 @@ class Tab(QWidget):
             row.addWidget(b)
         side.addLayout(row)
         split = QSplitter()
-        split.addWidget(self.table)
+        split.addWidget(self.views)
         split.addWidget(pane)
-        split.setSizes([760, 300])
+        split.setSizes([800, 300])
         box.addWidget(split, 1)
+        self.views.setCurrentIndex(self.grid_btn.isChecked())
+        self.match_search_kind()
+        self.search_kind_changed()
         self.show_entry(None)
 
+    # ----- what is shown -----
+
+    def kinds(self):
+        return {k for k, b in self.chips.items() if b.isChecked()}
+
+    def only(self, kind):
+        for k, b in self.chips.items():
+            b.blockSignals(True)
+            b.setChecked(kind in (None, k))
+            b.blockSignals(False)
+        self.kinds_changed()
+
+    def kinds_changed(self, *_):
+        self.main.conf["kinds"] = sorted(self.kinds())
+        store.save_conf(self.main.conf)
+        self.match_search_kind()
+        self.fill()
+
+    def match_search_kind(self):
+        kinds = self.kinds()
+        if len(kinds) == 1:  # one kind showing: search that one
+            self.search_kind.setCurrentIndex(self.search_kind.findData(kinds.pop()))
+
+    def search_kind_changed(self, *_):
+        kind = self.search_kind.currentData()
+        self.search.setPlaceholderText(f"Search {SITE_NAME[kind]} for {store.KINDS[kind].lower()}, press Enter")
+
+    def view_changed(self):
+        grid = self.grid_btn.isChecked()
+        self.main.conf["view"] = "grid" if grid else "list"
+        store.save_conf(self.main.conf)
+        self.views.setCurrentIndex(grid)
+        self.fill()
+
     def reload(self):
-        self.rows = store.entries(self.main.db, self.kind)
+        self.rows = store.entries(self.main.db)
+        counts = {k: 0 for k in store.KINDS}
+        for e in self.rows:
+            counts[e["kind"]] += 1
+        for k, b in self.chips.items():
+            b.setText(f"{store.KINDS[k]}  {counts[k]}")
+            b.setMinimumWidth(b.fontMetrics().horizontalAdvance(b.text()) + 40)  # the stylesheet padding isn't in the size hint
         self.fill()
 
     def visible(self):
-        needle, status = self.filter.text().casefold(), self.status.currentData()
-        return [e for e in self.rows if (not status or e["status"] == status)
+        kinds, needle, status = self.kinds(), self.filter.text().casefold(), self.status.currentData()
+        return [e for e in self.rows if e["kind"] in kinds and (not status or e["status"] == status)
                 and needle in f"{e['title']} {e['creator']} {e['notes']}".casefold()]
 
-    def fill(self):
-        """ponytail: rebuilds the whole table, fine into the tens of thousands; a model/view pair if it ever lags."""
-        keep = self.current["id"] if self.current else None
-        rows = self.visible()
+    def fill(self, *_):
+        """ponytail: rebuilds the whole view, fine into the tens of thousands; a model/view pair if it ever lags."""
+        (self.fill_grid if self.grid_btn.isChecked() else self.fill_table)(self.visible(), self.current["id"] if self.current else None)
+        self.main.show_stats()
+
+    def fill_table(self, rows, keep):
         t = self.table
         t.blockSignals(True)
         t.setSortingEnabled(False)
         t.clearContents()
         t.setRowCount(len(rows))
         for y, e in enumerate(rows):
-            cells = (e["title"], e["creator"], e["year"], status_label(e["kind"], e["status"]), e["rating"], e["finished"])
-            if not self.kind:
-                cells = (KIND_ONE[e["kind"]], *cells)
+            cells = ("● " + KIND_ONE[e["kind"]], e["title"], e["creator"], e["year"], status_label(e["kind"], e["status"]), e["rating"], e["finished"])
             for x, v in enumerate(cells):
                 item = QTableWidgetItem()
                 item.setData(Qt.DisplayRole, v if v is not None else "")  # numbers stay numbers, so they sort as numbers
                 t.setItem(y, x, item)
-            t.item(y, self.title_col).setData(Qt.UserRole, e["id"])
+            t.item(y, 0).setForeground(QColor(KIND_COLOR[e["kind"]]))
+            t.item(y, self.title_col).setData(ID_ROLE, e["id"])
         t.setSortingEnabled(True)
         t.blockSignals(False)
         for y in range(t.rowCount()):
-            if t.item(y, self.title_col).data(Qt.UserRole) == keep:
+            if t.item(y, self.title_col).data(ID_ROLE) == keep:
                 t.selectRow(y)
                 break
         else:
             self.show_entry(None)
-        self.main.show_stats()
+
+    def fill_grid(self, rows, keep):
+        """ponytail: every cover in the filtered log is fetched and kept in memory (~135 KB each); fetch only the
+        scrolled-to tiles if logs of thousands of covers get slow or heavy."""
+        g = self.grid
+        g.blockSignals(True)
+        g.clear()
+        self.tiles = {}
+        for e in rows:
+            item = QListWidgetItem()
+            rating = f"{e['rating']:g}/10" if e["rating"] is not None else ""
+            item.setData(LINES_ROLE, (e["title"], " · ".join(str(x) for x in (e["year"], e["creator"]) if x),
+                                      " · ".join(x for x in (status_label(e["kind"], e["status"]), rating) if x)))
+            item.setData(ID_ROLE, e["id"])
+            item.setData(KIND_ROLE, KIND_COLOR[e["kind"]])
+            item.setToolTip(f"{e['title']}\n{store.KINDS[e['kind']]}")
+            g.addItem(item)
+            self.tiles[e["id"]] = item
+            self.paint_tile(item, e)
+            url = e["cover"]
+            if url and url not in self.pix:
+                self.pix[url] = False  # asked for
+                run(lambda url=url: load_cover(url), lambda path, err, url=url: self.got_tile(url, path, err))
+            if e["id"] == keep:
+                g.setCurrentItem(item)
+        g.blockSignals(False)
+        if not g.currentItem():
+            self.show_entry(None)
+
+    def paint_tile(self, item, e):
+        pix = self.pix.get(e["cover"]) if e["cover"] else None
+        item.setData(Qt.UserRole, "none" if not e["cover"] or pix is None else "wait")
+        hide = store.adult(e) and e["id"] not in self.revealed and not self.show_adult.isChecked()
+        item.setData(BLUR_ROLE, (blur(pix) if pix else False) if hide else None)
+        item.setData(COVER_ROLE, pix or None)
+
+    def got_tile(self, url, path, err):
+        pix = None if err else QPixmap(str(path))
+        self.pix[url] = pix.scaled(TILE_W, TILE_H, Qt.KeepAspectRatio, Qt.SmoothTransformation) if pix and not pix.isNull() else None
+        for e in self.rows:
+            if e["cover"] == url and e["id"] in self.tiles:
+                self.paint_tile(self.tiles[e["id"]], e)
 
     def stats(self):
         rows = self.visible()
@@ -683,13 +825,16 @@ class Tab(QWidget):
         mean = f", mean rating {sum(rated) / len(rated):.1f} of {len(rated)} rated" if rated else ""
         return f"{len(rows)} {'entry' if len(rows) == 1 else 'entries'}{mean}"
 
+    # ----- the selected entry -----
+
     def selected(self):
-        items = self.table.selectedItems()
-        if items:
-            entry_id = self.table.item(items[0].row(), self.title_col).data(Qt.UserRole)
-            self.show_entry(next((e for e in self.rows if e["id"] == entry_id), None))
+        if self.grid_btn.isChecked():
+            item = self.grid.currentItem() if self.grid.selectedItems() else None
+            entry_id = item.data(ID_ROLE) if item else None
         else:
-            self.show_entry(None)
+            items = self.table.selectedItems()
+            entry_id = self.table.item(items[0].row(), self.title_col).data(ID_ROLE) if items else None
+        self.show_entry(next((e for e in self.rows if e["id"] == entry_id), None))
 
     def show_entry(self, e):
         self.current = e
@@ -702,8 +847,9 @@ class Tab(QWidget):
             self.heading.clear(), self.meta.clear(), self.notes.clear()
             return
         self.heading.setText(e["title"])
-        bits = [e["creator"], str(e["year"] or ""), status_label(e["kind"], e["status"]), f"{e['rating']:g}/10" if e["rating"] is not None else "",
-                f"progress {e['progress']}" if e["progress"] else "", f"from {e['started']}" if e["started"] else "", f"finished {e['finished']}" if e["finished"] else ""]
+        bits = [store.KINDS[e["kind"]], e["creator"], str(e["year"] or ""), status_label(e["kind"], e["status"]),
+                f"{e['rating']:g}/10" if e["rating"] is not None else "", f"progress {e['progress']}" if e["progress"] else "",
+                f"from {e['started']}" if e["started"] else "", f"finished {e['finished']}" if e["finished"] else ""]
         self.meta.setText(" · ".join(b for b in bits if b))
         self.notes.setPlainText(e["notes"])
         if e["cover"]:
@@ -719,7 +865,7 @@ class Tab(QWidget):
         e, pix = self.current, self.cover_pix
         if not e or not pix or pix.isNull():
             return
-        if store.adult(e) and e["id"] not in self.revealed:
+        if store.adult(e) and e["id"] not in self.revealed and not self.show_adult.isChecked():
             pix = blur(pix)
             p = QPainter(pix)
             badge(p, pix.rect(), "18+ · click to show")
@@ -730,34 +876,44 @@ class Tab(QWidget):
         self.cover.setPixmap(pix)
 
     def reveal_cover(self):
-        if self.current:
-            self.revealed ^= {self.current["id"]}  # click again to blur it back
+        e = self.current
+        if e:
+            self.revealed ^= {e["id"]}  # click again to blur it back
             self.paint_cover()
+            if e["id"] in self.tiles:
+                self.paint_tile(self.tiles[e["id"]], e)
+
+    def reveal_all(self, *_):
+        self.paint_cover()
+        for e in self.rows:
+            if e["id"] in self.tiles:
+                self.paint_tile(self.tiles[e["id"]], e)
+
+    # ----- search and edit -----
 
     def do_search(self):
-        q = self.search.text().strip()
+        q, kind = self.search.text().strip(), self.search_kind.currentData()
         if not q:
             return
         self.search_id += 1
         ticket = self.search_id
-        self.main.statusBar().showMessage(f"Searching {SITE_NAME[self.kind]}…")
-        kind = self.kind
-        run(lambda: sources.search(kind, q), lambda rows, err: self.results(ticket, rows, err))
+        self.main.statusBar().showMessage(f"Searching {SITE_NAME[kind]}…")
+        run(lambda: sources.search(kind, q), lambda rows, err: self.results(ticket, kind, rows, err))
 
-    def results(self, ticket, rows, err):
+    def results(self, ticket, kind, rows, err):
         if ticket != self.search_id:
             return  # a newer search replaced this one
         self.main.show_stats()
         if err:
             show_error(self, "Search failed", err)
             return
-        dlg = ResultsDialog(self, self.main.db, self.kind, rows)
+        dlg = ResultsDialog(self, self.main.db, kind, rows)
         picked = dlg.exec() and dlg.chosen is not None
         dlg.deleteLater()
         if picked:
             r = dlg.chosen
             old = store.find(self.main.db, r["site"], r["key"]) if r else None
-            self.log_row(old or {**r, "kind": self.kind})
+            self.log_row(old or {**r, "kind": kind})
 
     def log_row(self, row):
         dlg = LogDialog(self, row)
@@ -782,7 +938,7 @@ class Main(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Media Logger")
-        self.resize(1100, 720)
+        self.resize(1200, 760)
         self.conf = store.load_conf()
         names = store.list_profiles()
         self.profile = self.conf.get("profile") if self.conf.get("profile") in names else (names[0] if names else "default")
@@ -806,12 +962,9 @@ class Main(QMainWindow):
         scan_act.triggered.connect(lambda: ScanDialog(self).exec())
         bar.addAction(scan_act)
 
-        self.tabs = QTabWidget()
-        self.setCentralWidget(self.tabs)
-        for kind, label in ((None, "All"), *store.KINDS.items()):
-            self.tabs.addTab(Tab(self, kind), label)
-        self.tabs.currentChanged.connect(self.refresh)
-        QShortcut(QKeySequence("Ctrl+F"), self, lambda: self.tabs.currentWidget().filter.setFocus())
+        self.home = Home(self)
+        self.setCentralWidget(self.home)
+        QShortcut(QKeySequence("Ctrl+F"), self, lambda: self.home.filter.setFocus())
         self.load_profiles()
         self.refresh()
 
@@ -821,12 +974,11 @@ class Main(QMainWindow):
         self.combo.setCurrentText(self.profile)
 
     def refresh(self, *_):
-        self.tabs.currentWidget().reload()
+        self.home.reload()
 
     def show_stats(self):
-        tab = self.tabs.currentWidget()
-        if tab is not None:
-            self.statusBar().showMessage(f"{self.profile}: {tab.stats()}")
+        if hasattr(self, "home"):  # the first fill runs while Home is still being built
+            self.statusBar().showMessage(f"{self.profile}: {self.home.stats()}")
 
     def switch(self, name):
         self.db.close()
@@ -834,8 +986,7 @@ class Main(QMainWindow):
         self.conf["profile"] = name
         store.save_conf(self.conf)
         self.load_profiles()
-        for i in range(self.tabs.count()):
-            self.tabs.widget(i).current = None
+        self.home.current = None
         self.refresh()
 
     def new_profile(self):

@@ -27,7 +27,7 @@ Includes a desktop entry.
 
 ## What each site does
 
-| Tab | Site | Search | Your history |
+| Kind | Site | Search | Your history |
 |---|---|---|---|
 | Anime, Manga | AniList | AniList | Pull by username (the list must be public) |
 | Visual novels | VNDB | VNDB | Pull by username |
@@ -40,7 +40,9 @@ The app never requests RateYourMusic or Letterboxd pages. Both block automated c
 
 ## Using it
 
-Search in a tab and press Enter, pick a result, and fill in the log form. **Add by hand…** covers anything search misses. Ratings are 0–10 everywhere; imported ratings are converted (Letterboxd stars × 2, VNDB votes ÷ 10).
+Everything you log is on one page. The colored buttons at the top choose which kinds show (right-click one to show only that kind, **All** brings them all back), and **List** / **Grid** switch between a sortable table and a wall of covers. Both choices are remembered.
+
+To log something, pick a kind next to the search box, type, and press Enter (when only one kind is showing, the search follows it). Pick a result and fill in the log form. **Add by hand…** covers anything search misses. Ratings are 0–10 everywhere; imported ratings are converted (Letterboxd stars × 2, VNDB votes ÷ 10).
 
 **Sync from sites…** pulls usernames and reads export files. It always shows a preview first ("+12 new, 3 updated, 5 kept local"). Sync never deletes, never blanks a field, and never overwrites an entry you saved by hand.
 
