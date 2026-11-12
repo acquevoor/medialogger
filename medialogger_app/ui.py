@@ -1042,9 +1042,10 @@ def grid_name(e):
 
 
 class GridCanvas(QWidget):
-    """Paints the grid scaled to fit; the export paints the same thing at full size. Click a cell to pick it,
-    drag one cell onto another to swap them, drop a log entry from the list onto a cell, Delete or right-click clears."""
-    BASE = 100  # cell size the screen layout is computed at, before scaling to the widget
+    """Paints the grid at the biggest whole-pixel cell size that fits; the export paints the same thing at its own
+    size. Never scaled: a fractional scale rounds cells to uneven widths (82 and 83 px side by side).
+    Click a cell to pick it, drag one cell onto another to swap them, drop a log entry from the list onto a cell,
+    Delete or right-click clears."""
 
     def __init__(self, tab):
         super().__init__()
@@ -1054,23 +1055,26 @@ class GridCanvas(QWidget):
         self.setMinimumSize(300, 300)
 
     def geometry_(self):
-        w, h = self.tab.size_at(self.BASE)
-        s = min(self.width() / w, self.height() / h)
-        return s, (self.width() - w * s) / 2, (self.height() - h * s) / 2
+        """-> cell size, left and top offset."""
+        w, h = self.tab.size_at(100)
+        cell = max(4, int(100 * min(self.width() / w, self.height() / h)))
+        while cell > 4 and (self.tab.size_at(cell)[0] > self.width() or self.tab.size_at(cell)[1] > self.height()):
+            cell -= 1  # the names column doesn't grow exactly in step with the cells
+        w, h = self.tab.size_at(cell)
+        return cell, (self.width() - w) // 2, (self.height() - h) // 2
 
     def cell_at(self, pos):
-        s, ox, oy = self.geometry_()
-        x, y = int((pos.x() - ox) / s // self.BASE), int((pos.y() - oy) / s // self.BASE)
+        cell, ox, oy = self.geometry_()
+        x, y = int((pos.x() - ox) // cell), int((pos.y() - oy) // cell)
         t = self.tab
         return y * t.cols.value() + x if 0 <= x < t.cols.value() and 0 <= y < t.rows.value() else None
 
     def paintEvent(self, ev):
         p = QPainter(self)
         p.fillRect(self.rect(), self.palette().window())
-        s, ox, oy = self.geometry_()
+        cell, ox, oy = self.geometry_()
         p.translate(ox, oy)
-        p.scale(s, s)
-        self.tab.render(p, self.BASE, self.sel)
+        self.tab.render(p, cell, self.sel)
         p.end()
 
     def mousePressEvent(self, ev):
