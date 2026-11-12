@@ -121,9 +121,12 @@ def update(folder=HERE, code=CODE):
                                env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
             print("Not updated:", r.stderr.strip()) if r.returncode else print("Up to date")
             return
-        sha = fetch(f"https://api.github.com/repos/{REPO}/commits/master", "application/vnd.github.sha", 8).decode().strip()
-        if not re.fullmatch("[0-9a-f]{40}", sha):
+        # git's own ref list, as `git ls-remote` reads it: the REST API allows 60 calls an hour per IP, and a shared IP runs out
+        refs = fetch(f"https://github.com/{REPO}.git/info/refs?service=git-upload-pack", timeout=8)
+        m = re.search(rb"([0-9a-f]{40}) refs/heads/master\b", refs)
+        if not m:
             raise ValueError("unexpected answer from GitHub")
+        sha = m.group(1).decode()
         if os.path.basename(current(code) or "") == sha:
             return print("Up to date")
         os.makedirs(code, exist_ok=True)
