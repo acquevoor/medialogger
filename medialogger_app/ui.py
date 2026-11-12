@@ -18,9 +18,9 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QC
 from . import imports, scan, sources, store
 
 log = logging.getLogger("medialogger")
-ACTIVE = {"game": "Playing", "anime": "Watching", "manga": "Reading", "music": "Listening", "film": "Watching", "novel": "Reading", "vn": "Reading"}
-DONE = {"game": "Played", "anime": "Watched", "manga": "Read", "music": "Listened", "film": "Watched", "novel": "Read", "vn": "Read"}
-SITE_NAME = {"game": "Steam + Wikidata", "anime": "AniList", "manga": "AniList", "music": "MusicBrainz", "film": "Wikidata", "novel": "RanobeDB", "vn": "VNDB"}
+ACTIVE = {"game": "Playing", "anime": "Watching", "manga": "Reading", "music": "Listening", "film": "Watching", "novel": "Reading", "vn": "Reading", "character": "Following"}
+DONE = {"game": "Played", "anime": "Watched", "manga": "Read", "music": "Listened", "film": "Watched", "novel": "Read", "vn": "Read", "character": "Favorite"}
+SITE_NAME = {"game": "Steam + Wikidata", "anime": "AniList", "manga": "AniList", "music": "MusicBrainz", "film": "Wikidata", "novel": "RanobeDB", "vn": "VNDB", "character": "AniList + VNDB + Wikidata"}
 MANUAL_SHARED = ("film", "music")  # hand-added ones share keys with exports, so a later import lands on the same row
 
 
@@ -575,8 +575,8 @@ class ScanDialog(QDialog):
 
 # ---------- the home page ----------
 
-KIND_ONE = {"game": "game", "anime": "anime", "manga": "manga", "music": "album", "film": "film", "novel": "light novel", "vn": "visual novel"}
-KIND_COLOR = {"game": "#2e9e5b", "anime": "#3b7dd8", "manga": "#8e5bd0", "music": "#e08a1e", "film": "#d64545", "novel": "#1f9e9e", "vn": "#d44d9a"}
+KIND_ONE = {"game": "game", "anime": "anime", "manga": "manga", "music": "album", "film": "film", "novel": "light novel", "vn": "visual novel", "character": "character"}
+KIND_COLOR = {"game": "#2e9e5b", "anime": "#3b7dd8", "manga": "#8e5bd0", "music": "#e08a1e", "film": "#d64545", "novel": "#1f9e9e", "vn": "#d44d9a", "character": "#b8860b"}
 COLUMNS = ("Type", "Title", "Creator", "Year", "Status", "Rating", "Finished")
 ID_ROLE, KIND_ROLE = Qt.UserRole + 4, Qt.UserRole + 5
 
@@ -599,7 +599,7 @@ class Home(QWidget):
 
         chips = QHBoxLayout()
         self.chips = {}
-        shown = set(conf.get("kinds") or store.KINDS) & set(store.KINDS)
+        shown = set(store.KINDS) - set(conf.get("hidden") or ())
         for kind, label in store.KINDS.items():
             b = QPushButton(label, checkable=True, checked=kind in shown)
             b.setStyleSheet(chip_style(KIND_COLOR[kind]))
@@ -717,7 +717,7 @@ class Home(QWidget):
         self.kinds_changed()
 
     def kinds_changed(self, *_):
-        self.main.conf["kinds"] = sorted(self.kinds())
+        self.main.conf["hidden"] = sorted(set(store.KINDS) - self.kinds())
         store.save_conf(self.main.conf)
         self.match_search_kind()
         self.search_kind_changed()

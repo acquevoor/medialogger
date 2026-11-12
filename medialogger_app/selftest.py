@@ -130,6 +130,40 @@ def stub(replies):
     return calls
 
 
+def test_characters():
+    real = src.fetch, src.slow_fetch
+    try:
+        stub({"anilist": {"data": {"c": {"characters": [{"id": 34470, "siteUrl": "https://anilist.co/character/34470", "name": {"full": "Kurisu Makise", "native": "牧瀬紅莉栖", "alternative": ["Christina"]},
+                                                          "image": {"large": "https://s4.anilist.co/c.png"}, "media": {"nodes": [{"title": {"romaji": "Steins;Gate", "english": None}, "isAdult": False}]}}]},
+                                       "s": {"staff": [{"id": 103662, "siteUrl": "https://anilist.co/staff/103662", "name": {"full": "Asami Imai", "native": "今井麻美", "alternative": []},
+                                                        "image": {"large": ""}, "primaryOccupations": ["Voice Actor"], "languageV2": "Japanese", "dateOfBirth": {"year": 1977}}]}}},
+              "vndb": {"results": [{"id": "c1007", "name": "Chris Kanu", "original": "栗栖花濡", "aliases": [], "image": {"url": "https://t.vndb.org/ch/57/1057.jpg", "sexual": 2},
+                                    "vns": [{"id": "v1912", "title": "Eden"}]}]},
+              "wikidata": {"results": {"bindings": [{"f": {"value": "http://www.wikidata.org/entity/Q43416"}, "title": {"value": "Keanu Reeves"}, "d": {"value": "1964-09-02T00:00:00Z"},
+                                                     "by": {"value": "actor, voice actor"}, "wpt": {"value": "Keanu Reeves"}, "klass": {"value": "http://www.wikidata.org/entity/Q5"}}]}},
+              "wikipedia": {"query": {"pages": []}}})
+        rows = src.search("character", "x")
+        by = {r["key"]: r for r in rows}
+        assert set(by) == {"character:34470", "staff:103662", "c1007", "wikidata:Q43416"}, list(by)
+        assert by["character:34470"]["creator"] == "Steins;Gate" and "Christina" in by["character:34470"]["alt"]
+        assert by["staff:103662"]["detail"] == "Voice Actor" and by["staff:103662"]["year"] == 1977
+        assert by["c1007"]["nsfw"] and not by["character:34470"]["nsfw"]
+        assert by["wikidata:Q43416"]["detail"] == "Person" and by["wikidata:Q43416"]["url"] == "https://en.wikipedia.org/wiki/Keanu_Reeves"
+        for r in rows:
+            st.clean({**{f: "" for f in st.SITE_FIELDS}, "rating": None, "progress": None, "year": None, "status": "planned", **{k: v for k, v in r.items() if k not in ("detail", "alt")}})
+        vn = {"results": [{"id": "c1", "name": "A", "vns": []}]}
+        stub({"anilist": b"<html>busy", "vndb": vn, "wikidata": {"results": {"bindings": []}}, "wikipedia": {}})
+        assert [r["key"] for r in src.search("character", "x")] == ["c1"]  # AniList down: the others still answer
+        stub({"anilist": b"<html>busy", "vndb": {"results": []}, "wikidata": {"results": {"bindings": []}}, "wikipedia": {}})
+        try:
+            src.search("character", "x")
+            raise AssertionError("nothing found and a site down: say so, not 'no results'")
+        except RuntimeError as e:
+            assert "AniList" in str(e)
+    finally:
+        src.fetch, src.slow_fetch = real
+
+
 def test_search_many():
     real = src.search
     def fake(kind, q):
@@ -556,6 +590,7 @@ def selftest():
         test_mapping()
         test_sources()
         test_search_many()
+        test_characters()
         test_imports(tmp)
         test_adult(tmp)
         test_scan(tmp)

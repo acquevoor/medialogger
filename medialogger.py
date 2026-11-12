@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""medialogger: a local log of games, anime, manga, music, films, light novels and visual novels. This launcher installs
+"""medialogger: a local log of games, anime, manga, music, films, light novels, visual novels and characters. This launcher installs
 PySide6 on a plain Python (Windows double-click), keeps the app up to date and starts it. The app lives in the
 medialogger_app/ folder next to this file."""
 import importlib.util

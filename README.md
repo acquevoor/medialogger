@@ -1,6 +1,6 @@
 # medialogger
 
-A local log for games, anime, manga, music, films, light novels and visual novels. Your log lives on your machine; nothing is ever written back to a site, and no tokens are needed.
+A local log for games, anime, manga, music, films, light novels, visual novels, and the characters and people behind them (fictional characters, actors, voice actors). Your log lives on your machine; nothing is ever written back to a site, and no tokens are needed.
 
 PySide6 + Python stdlib.
 
@@ -35,6 +35,7 @@ Includes a desktop entry.
 | Games | Backloggd | Steam and Wikidata | None, Backloggd's `robots.txt` disallows user pages |
 | Films | Letterboxd | Wikidata | Export zip, plus RSS for recent watches |
 | Music | RateYourMusic | MusicBrainz | CSV export |
+| Characters | AniList, VNDB, Wikidata | Characters and staff (voice actors, cast) on AniList, VN characters on VNDB, real people and western characters on Wikidata | None |
 
 The app never requests RateYourMusic or Letterboxd pages. Both block automated clients and RYM disallows all crawling, so they only appear as links that open in your browser. Letterboxd's public RSS is the one exception.
 

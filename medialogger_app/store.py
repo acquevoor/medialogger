@@ -14,10 +14,10 @@ import urllib.parse
 from datetime import date
 from pathlib import Path
 
-KINDS = {"game": "Games", "anime": "Anime", "manga": "Manga", "music": "Music", "film": "Films", "novel": "Light novels", "vn": "Visual novels"}
+KINDS = {"game": "Games", "anime": "Anime", "manga": "Manga", "music": "Music", "film": "Films", "novel": "Light novels", "vn": "Visual novels", "character": "Characters"}
 STATUSES = ("planned", "active", "done", "paused", "dropped")
-SITES = ("backloggd", "anilist", "rym", "letterboxd", "ranobedb", "vndb", "manual")
-SITE_OF = {"game": "backloggd", "anime": "anilist", "manga": "anilist", "music": "rym", "film": "letterboxd", "novel": "ranobedb", "vn": "vndb"}
+SITES = ("backloggd", "anilist", "rym", "letterboxd", "ranobedb", "vndb", "wikidata", "manual")
+SITE_OF = {"game": "backloggd", "anime": "anilist", "manga": "anilist", "music": "rym", "film": "letterboxd", "novel": "ranobedb", "vn": "vndb", "character": "anilist"}
 USERNAMES = ("anilist", "vndb", "letterboxd")
 # every host a cover may come from, redirects included: a crafted profile must not make the app call anything else
 COVER_HOSTS = ("anilist.co", "vndb.org", "ranobedb.org", "steamstatic.com", "coverartarchive.org", "archive.org", "wikimedia.org", "ltrbxd.com")

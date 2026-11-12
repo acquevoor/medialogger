@@ -202,12 +202,12 @@ def vndb_pull(user):
 # One row per item, in the search's own relevance order (apiOrdinal), with what tells same-titled things apart:
 # year, creator (director / developer) and platforms. en,mul labels: Hades has no plain en one.
 SPARQL = """SELECT ?f ?ord (SAMPLE(?lab) AS ?title) (MIN(?date) AS ?d) (SAMPLE(?slug) AS ?lb) (SAMPLE(?steam) AS ?st) (SAMPLE(?wp) AS ?wpt)
-  (SAMPLE(?img) AS ?pic) (GROUP_CONCAT(DISTINCT ?byL; separator=", ") AS ?by) (GROUP_CONCAT(DISTINCT ?platL; separator=", ") AS ?plats) (MAX(?adult) AS ?x) WHERE {
+  (SAMPLE(?img) AS ?pic) (GROUP_CONCAT(DISTINCT ?byL; separator=", ") AS ?by) (GROUP_CONCAT(DISTINCT ?platL; separator=", ") AS ?plats) (MAX(?adult) AS ?x) (SAMPLE(?k) AS ?klass) WHERE {
   SERVICE wikibase:mwapi { bd:serviceParam wikibase:api "EntitySearch"; wikibase:endpoint "www.wikidata.org";
     mwapi:search %s; mwapi:language "en"; wikibase:limit 30 . ?f wikibase:apiOutputItem mwapi:item. ?ord wikibase:apiOrdinal true. }
   ?f %s.
   OPTIONAL { ?f rdfs:label ?lab FILTER(LANG(?lab) IN ("en", "mul")) }
-  OPTIONAL { ?f wdt:P577 ?date } OPTIONAL { ?f wdt:P6127 ?slug } OPTIONAL { ?f wdt:P1733 ?steam } OPTIONAL { ?f wdt:P18 ?img }
+  OPTIONAL { ?f wdt:P577|wdt:P569 ?date } OPTIONAL { ?f wdt:P6127 ?slug } OPTIONAL { ?f wdt:P1733 ?steam } OPTIONAL { ?f wdt:P18 ?img }
   OPTIONAL { ?wpa schema:about ?f; schema:isPartOf <https://en.wikipedia.org/>; schema:name ?wp }
   OPTIONAL { ?f wdt:%s ?b. ?b rdfs:label ?byL FILTER(LANG(?byL) = "en") }
   OPTIONAL { ?f wdt:P400 ?p. ?p rdfs:label ?platL FILTER(LANG(?platL) = "en") }
@@ -219,7 +219,8 @@ ADULT_ITEMS = "wd:Q1046788 wd:Q7230210 wd:Q3362070 wd:Q14864332 wd:Q185529 wd:Q5
 
 
 def wikidata(q, cls, by):
-    """-> [{id, title, year, slug, steam, wp, img, creator, platforms}] in relevance order. by: P57 director, P178 developer."""
+    """-> [{id, title, year, slug, steam, wp, img, creator, platforms, klass}] in relevance order.
+    by: P57 director, P178 developer, P106 occupation. year: release, or birth for people."""
     url = "https://query.wikidata.org/sparql?" + urllib.parse.urlencode({"query": SPARQL % (json.dumps(q), cls, by, ADULT_ITEMS)})
     doc = _json("Wikidata", lambda: slow_fetch(url, {"Accept": "application/sparql-results+json"}))
     out = []
@@ -228,7 +229,8 @@ def wikidata(q, cls, by):
         if not v.get("title"):
             continue  # no English or multilingual name
         out.append({"id": v["f"].rsplit("/", 1)[1], "title": v["title"], "year": _year(v.get("d")), "slug": v.get("lb", ""), "steam": v.get("st", ""),
-                    "wp": v.get("wpt", ""), "img": v.get("pic", ""), "creator": v.get("by", ""), "platforms": v.get("plats", ""), "nsfw": v.get("x") == "1"})
+                    "wp": v.get("wpt", ""), "img": v.get("pic", ""), "creator": v.get("by", ""), "platforms": v.get("plats", ""), "nsfw": v.get("x") == "1",
+                    "klass": v.get("klass", "").rsplit("/", 1)[-1]})
     return out
 
 
@@ -389,11 +391,69 @@ def novel_search(q):
     return out
 
 
+# ---------- characters and people ----------
+
+PEOPLE_Q = ("query($s:String){c:Page(perPage:15){characters(search:$s){id siteUrl name{full native alternative} image{large}"
+            " media(perPage:1,sort:POPULARITY_DESC){nodes{title{romaji english} isAdult}}}}"
+            " s:Page(perPage:10){staff(search:$s){id siteUrl name{full native alternative} image{large} primaryOccupations languageV2 dateOfBirth{year}}}}")
+
+
+def anilist_people(q):
+    """Anime, manga and game characters, and the staff behind them: voice actors, live-action cast, artists."""
+    doc = _post("AniList", ANILIST, {"query": PEOPLE_Q, "variables": {"s": q}})["data"]
+    out = []
+    for c in doc["c"]["characters"]:
+        work = (c["media"]["nodes"] or [{}])[0]
+        title = (work.get("title") or {})
+        out.append({"kind": "character", "site": "anilist", "key": f"character:{c['id']}", "title": c["name"]["full"], "creator": title.get("english") or title.get("romaji") or "",
+                    "detail": "Character", "url": c["siteUrl"], "cover": (c.get("image") or {}).get("large") or "", "nsfw": bool(work.get("isAdult")),
+                    "alt": [x for x in (c["name"].get("native"), *(c["name"].get("alternative") or [])) if x]})
+    for p in doc["s"]["staff"]:
+        jobs = ", ".join(p.get("primaryOccupations") or []) or "Staff"
+        out.append({"kind": "character", "site": "anilist", "key": f"staff:{p['id']}", "title": p["name"]["full"], "year": (p.get("dateOfBirth") or {}).get("year"),
+                    "creator": p.get("languageV2") or "", "detail": jobs, "url": p["siteUrl"], "cover": (p.get("image") or {}).get("large") or "", "nsfw": False,
+                    "alt": [x for x in (p["name"].get("native"), *(p["name"].get("alternative") or [])) if x]})
+    return out
+
+
+def vndb_characters(q):
+    doc = _post("VNDB", f"{VNDB}/character", {"filters": ["search", "=", q], "fields": "name,original,aliases,image.url,image.sexual,vns.title", "results": 15})
+    return [{"kind": "character", "site": "vndb", "key": c["id"], "title": c["name"], "creator": (c.get("vns") or [{}])[0].get("title", ""),
+             "detail": "VN character", "url": f"https://vndb.org/{c['id']}", "cover": (c.get("image") or {}).get("url") or "",
+             "nsfw": ((c.get("image") or {}).get("sexual") or 0) >= 1, "alt": [x for x in (c.get("original"), *(c.get("aliases") or [])) if x]}
+            for c in doc["results"]]
+
+
+def wikidata_people(q):
+    """Real people (actors, singers, authors) and characters from western films, games and books.
+    ponytail: Wikidata's own search ranking decides; a bare "Mario" ranks the plumber below 30 namesakes, "Super Mario" finds him."""
+    items = wikidata(q, "wdt:P31/wdt:P279* ?k. VALUES ?k { wd:Q5 wd:Q95074 }", "P106|wdt:P1441")
+    covers = wiki_covers(it["wp"] for it in items)
+    return [{"kind": "character", "site": "wikidata", "key": f"wikidata:{it['id']}", "title": it["title"], "year": it["year"] if it["klass"] == "Q5" else None,
+             "creator": it["creator"], "detail": "Person" if it["klass"] == "Q5" else "Character",
+             "url": f"https://en.wikipedia.org/wiki/{urllib.parse.quote(it['wp'].replace(' ', '_'))}" if it["wp"] else f"https://www.wikidata.org/wiki/{it['id']}",
+             "cover": covers.get(it["wp"]) or _commons(it["img"]), "nsfw": False} for it in items]
+
+
+def character_search(q):
+    """AniList, VNDB and Wikidata at once; whichever answer count, an error only if none do."""
+    rows, errors = [], []
+    with ThreadPoolExecutor(3) as ex:
+        for job in [ex.submit(f, q) for f in (anilist_people, vndb_characters, wikidata_people)]:
+            try:
+                rows += job.result()
+            except RuntimeError as e:
+                errors.append(e)
+    if errors and not rows:
+        raise errors[0]
+    return rows
+
+
 def search(kind, q):
     """-> rows ready for the Log dialog: kind, site, key, title and whatever else the site knows."""
     if kind in ("anime", "manga"):
         return anilist_search(kind, q)
-    return {"game": game_search, "music": music_search, "film": film_search, "novel": novel_search, "vn": vndb_search}[kind](q)
+    return {"game": game_search, "music": music_search, "film": film_search, "novel": novel_search, "vn": vndb_search, "character": character_search}[kind](q)
 
 
 def search_many(kinds, q):
