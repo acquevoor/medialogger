@@ -130,6 +130,25 @@ def stub(replies):
     return calls
 
 
+def test_search_many():
+    real = src.search
+    def fake(kind, q):
+        if kind == "vn":
+            raise OSError("down")
+        return [{"kind": kind, "title": q}]
+    src.search = fake
+    try:
+        rows, errors = src.search_many(["game", "vn", "film"], "x")
+        assert [r["kind"] for r in rows] == ["game", "film"] and list(errors) == ["vn"], (rows, errors)
+        try:
+            src.search_many(["vn"], "x")
+            raise AssertionError("every site down must raise")
+        except RuntimeError as e:
+            assert "vn: down" in str(e)
+    finally:
+        src.search = real
+
+
 def test_sources():
     real = src.fetch, src.slow_fetch
     try:
@@ -536,6 +555,7 @@ def selftest():
         test_rejects(tmp)
         test_mapping()
         test_sources()
+        test_search_many()
         test_imports(tmp)
         test_adult(tmp)
         test_scan(tmp)

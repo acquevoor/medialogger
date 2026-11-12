@@ -221,9 +221,10 @@ class ResultsDialog(QDialog):
     """Search results as a cover grid, like imagesearcher's: the cover, year, creator and the detail line (platforms,
     format, release type) are what tell same-titled things apart."""
 
-    def __init__(self, parent, db, kind, rows):
+    def __init__(self, parent, db, heading, rows):
         super().__init__(parent)
-        self.setWindowTitle(f"{store.KINDS[kind]}: {len(rows)} found")
+        self.setWindowTitle(f"{heading}: {len(rows)} found")
+        mixed = len({r["kind"] for r in rows}) > 1
         self.resize(1040, 760)
         self.rows, self.chosen, self.alive = rows, None, True
         box = QVBoxLayout(self)
@@ -241,9 +242,11 @@ class ResultsDialog(QDialog):
             item = QListWidgetItem()
             item.setData(LINES_ROLE, (title, meta, r.get("detail", "")))
             item.setData(Qt.UserRole, "wait" if r.get("cover") else "none")
+            if mixed:
+                item.setData(KIND_ROLE, KIND_COLOR[r["kind"]])
             if store.adult(r):
                 item.setData(BLUR_ROLE, False)  # blurred version comes with the cover; False: nothing to show yet
-            item.setToolTip("\n".join(x for x in (r["title"], meta, r.get("detail", "")) if x) + ("\n\nAlready in your log" if logged else ""))
+            item.setToolTip("\n".join(x for x in (r["title"], store.KINDS[r["kind"]], meta, r.get("detail", "")) if x) + ("\n\nAlready in your log" if logged else ""))
             self.grid.addItem(item)
             if r.get("cover"):
                 url = r["cover"]
@@ -621,13 +624,14 @@ class Home(QWidget):
 
         top = QHBoxLayout()
         self.search_kind = QComboBox()
+        self.search_kind.addItem("Shown kinds", None)  # every toggled kind's site at once
         for kind, label in store.KINDS.items():
             self.search_kind.addItem(label, kind)
         self.search_kind.currentIndexChanged.connect(self.search_kind_changed)
         self.search = QLineEdit()
         self.search.returnPressed.connect(self.do_search)
         add = QPushButton("Add by hand…")
-        add.clicked.connect(lambda: self.log_row({"kind": self.search_kind.currentData()}))
+        add.clicked.connect(self.add_by_hand)
         self.filter = QLineEdit(placeholderText="Filter your log")
         self.filter.textChanged.connect(self.fill)
         self.status = QComboBox()
@@ -716,16 +720,24 @@ class Home(QWidget):
         self.main.conf["kinds"] = sorted(self.kinds())
         store.save_conf(self.main.conf)
         self.match_search_kind()
+        self.search_kind_changed()
         self.fill()
 
     def match_search_kind(self):
         kinds = self.kinds()
-        if len(kinds) == 1:  # one kind showing: search that one
-            self.search_kind.setCurrentIndex(self.search_kind.findData(kinds.pop()))
+        self.search_kind.setCurrentIndex(self.search_kind.findData(kinds.pop()) if len(kinds) == 1 else 0)
+
+    def search_kinds(self):
+        kind = self.search_kind.currentData()
+        return [kind] if kind else [k for k in store.KINDS if k in self.kinds()]
 
     def search_kind_changed(self, *_):
         kind = self.search_kind.currentData()
-        self.search.setPlaceholderText(f"Search {SITE_NAME[kind]} for {store.KINDS[kind].lower()}, press Enter")
+        if kind:
+            self.search.setPlaceholderText(f"Search {SITE_NAME[kind]} for {store.KINDS[kind].lower()}, press Enter")
+        else:
+            sites = dict.fromkeys(SITE_NAME[k] for k in self.search_kinds())
+            self.search.setPlaceholderText(f"Search {', '.join(sites) or 'nothing: no kind is shown'}, press Enter")
 
     def view_changed(self):
         grid = self.grid_btn.isChecked()
@@ -892,28 +904,45 @@ class Home(QWidget):
     # ----- search and edit -----
 
     def do_search(self):
-        q, kind = self.search.text().strip(), self.search_kind.currentData()
-        if not q:
+        q, kinds = self.search.text().strip(), self.search_kinds()
+        if not q or not kinds:
             return
         self.search_id += 1
         ticket = self.search_id
-        self.main.statusBar().showMessage(f"Searching {SITE_NAME[kind]}…")
-        run(lambda: sources.search(kind, q), lambda rows, err: self.results(ticket, kind, rows, err))
+        self.main.statusBar().showMessage(f"Searching {', '.join(dict.fromkeys(SITE_NAME[k] for k in kinds))}…")
+        run(lambda: sources.search_many(kinds, q), lambda res, err: self.results(ticket, kinds, res, err))
 
-    def results(self, ticket, kind, rows, err):
+    def results(self, ticket, kinds, res, err):
         if ticket != self.search_id:
             return  # a newer search replaced this one
         self.main.show_stats()
         if err:
             show_error(self, "Search failed", err)
             return
-        dlg = ResultsDialog(self, self.main.db, kind, rows)
+        rows, errors = res
+        if errors:  # the others still answered: say which didn't, and show what came back
+            self.main.statusBar().showMessage("No answer from " + ", ".join(f"{SITE_NAME[k]} ({e})" for k, e in errors.items()))
+        heading = store.KINDS[kinds[0]] if len(kinds) == 1 else "Search"
+        dlg = ResultsDialog(self, self.main.db, heading, rows)
         picked = dlg.exec() and dlg.chosen is not None
         dlg.deleteLater()
         if picked:
             r = dlg.chosen
-            old = store.find(self.main.db, r["site"], r["key"]) if r else None
-            self.log_row(old or {**r, "kind": kind})
+            if not r:  # "Enter by hand…"
+                self.add_by_hand(kinds)
+                return
+            self.log_row(store.find(self.main.db, r["site"], r["key"]) or r)
+
+    def add_by_hand(self, kinds=None):
+        kinds = kinds or self.search_kinds() or list(store.KINDS)
+        kind = kinds[0]
+        if len(kinds) > 1:
+            labels = [store.KINDS[k] for k in kinds]
+            label, ok = QInputDialog.getItem(self, "Add by hand", "Kind:", labels, 0, False)
+            if not ok:
+                return
+            kind = kinds[labels.index(label)]
+        self.log_row({"kind": kind})
 
     def log_row(self, row):
         dlg = LogDialog(self, row)

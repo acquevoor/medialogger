@@ -396,6 +396,21 @@ def search(kind, q):
     return {"game": game_search, "music": music_search, "film": film_search, "novel": novel_search, "vn": vndb_search}[kind](q)
 
 
+def search_many(kinds, q):
+    """Every kind's site at once -> (rows, {kind: error}). One site down doesn't lose the others' results."""
+    with ThreadPoolExecutor(len(kinds)) as ex:
+        jobs = {k: ex.submit(search, k, q) for k in kinds}
+    rows, errors = [], {}
+    for k, job in jobs.items():
+        try:
+            rows += job.result()
+        except Exception as e:
+            errors[k] = e
+    if errors and not rows:
+        raise RuntimeError("\n".join(f"{k}: {e}" for k, e in errors.items()))
+    return rows, errors
+
+
 # ---------- Letterboxd RSS ----------
 
 LB = "{https://letterboxd.com}"
