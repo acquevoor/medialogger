@@ -114,7 +114,7 @@ def scan_folder(folder):
                         break
             kind = guess_kind(e.name, files)
             if kind:
-                out.append(_row(e.name, kind, files))
+                out.append(_row(e.name, kind, files, {"path": e.path}))
     return merge(out)
 
 
@@ -178,7 +178,8 @@ def scan_qbittorrent(dirs=None):
             category = _text(fr.get(b"qBt-category")).casefold()
             kind = next((k for word, k in CATEGORY_KINDS if word in category), None) or guess_kind(name, files)
             if kind:
-                out.append(_row(name, kind, files, {"done": bool(fr.get(b"completed_time"))}))
+                save = _text(fr.get(b"qBt-savePath")) or _text(fr.get(b"save_path"))
+                out.append(_row(name, kind, files, {"done": bool(fr.get(b"completed_time")), **({"path": os.path.join(save, name)} if save else {})}))
     return merge(out)
 
 
@@ -236,7 +237,7 @@ def scan_steam(roots=None, lookup=sources.steam_items, now=None):
     """Installed games (every library folder's app manifests) plus anything with playtime in localconfig.vdf, which
     covers games you played and uninstalled. Exact Steam ids, no guessing."""
     roots = steam_roots() if roots is None else [Path(r) for r in roots]
-    names, played, last = {}, {}, {}
+    names, played, last, where = {}, {}, {}, {}
     for root in roots:
         libraries = {root}
         try:
@@ -253,6 +254,8 @@ def scan_steam(roots=None, lookup=sources.steam_items, now=None):
                     continue
                 if app.get("appid") and app.get("name"):
                     names[app["appid"]] = app["name"]
+                    if app.get("installdir"):
+                        where[app["appid"]] = str(lib / "steamapps/common" / app["installdir"])
         for conf in root.glob("userdata/*/config/localconfig.vdf"):
             try:
                 apps = vdf(conf.read_text(encoding="utf-8", errors="replace"))
@@ -278,12 +281,48 @@ def scan_steam(roots=None, lookup=sources.steam_items, now=None):
     out = []
     for appid, name in sorted(names.items(), key=lambda x: x[1].casefold()):
         hours = played.get(appid, 0) / 60
-        out.append({"found": name, "kind": "game", "title": name, "year": None, "creator": "", "steam": True,
+        out.append({"found": name, "kind": "game", "title": name, "year": None, "creator": "", "steam": True, **({"path": where[appid]} if appid in where else {}),
                     "match": {"kind": "game", "site": "backloggd", "key": f"steam:{appid}", "title": name, "url": sources._link(sources.BACKLOGGD_SEARCH, name),
                               "cover": sources.STEAM_COVER.format(appid), "nsfw": appid in adult,
                               "status": steam_status(played.get(appid, 0), last.get(appid, 0), now),
                               "detail": f"{hours:.0f} h played" if hours >= 1 else "played" if appid in played else "installed"}})
     return out
+
+
+# ---------- opening what you have ----------
+
+OPENS = {"anime": VIDEO, "film": VIDEO, "music": AUDIO, "novel": BOOK, "manga": COMIC | BOOK, "game": GAME | {".sh"}, "vn": GAME | {".sh"}}
+NOT_MAIN = re.compile(r"unins|crash|redist|vcredist|dxsetup|directx|dotnet|setup|install|update|helper|report|sample|trailer|^nc(op|ed)", re.I)
+
+
+def main_file(path, kind):
+    """The file "Open file" opens: the path itself, or inside a folder the work's own file. Games: the biggest
+    program that isn't an uninstaller or redistributable. Everything else: the first by name among the big ones,
+    so a series opens at episode 1 and a sample clip is never it. -> path or None"""
+    if os.path.isfile(path):
+        return path
+    exts, found = OPENS.get(kind, set()), []
+    for root, dirs, names in os.walk(path):
+        dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+        for n in names:
+            if os.path.splitext(n)[1].lower() in exts and not NOT_MAIN.search(n):
+                try:
+                    found.append((os.path.getsize(os.path.join(root, n)), os.path.join(root, n)))
+                except OSError:
+                    pass
+        if len(found) >= MAX_FILES:
+            break
+    if not found:
+        return None
+    if kind in ("game", "vn"):
+        return max(found)[1]
+    big = max(found)[0] / 4
+    return min((p for size, p in found if size >= big), key=lambda p: p.casefold())
+
+
+def screenshots_dir(path):
+    """Where this work's screenshots go: a Screenshots folder in its own folder, or next to a lone file, named after it."""
+    return os.path.join(path, "Screenshots") if os.path.isdir(path) else os.path.splitext(path)[0] + " - Screenshots"
 
 
 # ---------- matching ----------

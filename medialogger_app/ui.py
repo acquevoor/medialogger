@@ -11,8 +11,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QRect, QSize, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QFontMetrics, QImage, QKeySequence, QPainter, QPen, QPixmap, QShortcut
-from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout,
+from PySide6.QtGui import QAction, QColor, QCursor, QDesktopServices, QFont, QFontMetrics, QImage, QKeySequence, QPainter, QPen, QPixmap, QShortcut
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QMenu, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout,
                                QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
                                QPlainTextEdit, QPushButton, QSpinBox, QSplitter, QStackedWidget, QStyle, QStyledItemDelegate, QTableWidget, QTableWidgetItem, QTabWidget, QToolBar, QVBoxLayout, QWidget)
 
@@ -73,6 +73,11 @@ def confirm(parent, title, text, yes="OK"):
 def open_link(url):
     if url.startswith("https://"):
         QDesktopServices.openUrl(QUrl(url))
+
+
+def open_local(path):
+    if path:
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
 
 
 def cover_file(url):
@@ -545,11 +550,11 @@ class ScanDialog(QDialog):
                 continue
             m = r.get("match")
             if m:
-                out.append({**m, "status": m.get("status", status) if r.get("steam") else status})
+                out.append({**m, "status": m.get("status", status) if r.get("steam") else status, "path": r.get("path", "")})
             elif r["title"]:
                 kind = r["kind"]
                 out.append({"kind": kind, "site": store.SITE_OF[kind] if kind in MANUAL_SHARED else "manual", "key": store.make_key(kind, r["title"], r.get("year"), r.get("creator", "")),
-                            "title": r["title"], "year": r.get("year"), "creator": r.get("creator", ""), "status": status})
+                            "title": r["title"], "year": r.get("year"), "creator": r.get("creator", ""), "status": status, "path": r.get("path", "")})
         return out
 
     def add(self):
@@ -562,12 +567,20 @@ class ScanDialog(QDialog):
         except ValueError as e:
             show_error(self, "Can't add", e)
             return
+        located = [r for r in rows if r["path"]]
         if not d["new"] and not d["update"]:
-            self.state.setText("Nothing new: " + store.summary(d))
+            self.save_paths(located)
+            self.state.setText(f"Nothing new: {store.summary(d)}. Locations saved for {len(located)}.")
+            self.main.refresh()
         elif confirm(self, "Add to your log?", store.summary(d), "Add"):
             store.apply(self.main.db, d)
+            self.save_paths(located)
             self.state.setText("Added: " + store.summary(d))
             self.main.refresh()
+
+    def save_paths(self, rows):
+        for r in rows:
+            store.set_path(self.main.db, r["site"], r["key"], r["path"])
 
     def done(self, code):
         self.alive = self.matching = False
@@ -671,6 +684,9 @@ class Home(QWidget):
         self.grid.setItemDelegate(Tile(self.grid))
         self.grid.itemSelectionChanged.connect(self.selected)
         self.grid.itemActivated.connect(lambda *_: self.edit())
+        self.grid.itemClicked.connect(lambda *_: self.actions())
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(lambda *_: self.actions())
         self.views = QStackedWidget()
         self.views.addWidget(self.table)
         self.views.addWidget(self.grid)
@@ -863,7 +879,8 @@ class Home(QWidget):
         bits = [store.KINDS[e["kind"]], e["creator"], str(e["year"] or ""), status_label(e["kind"], e["status"]),
                 f"{e['rating']:g}/10" if e["rating"] is not None else "", f"progress {e['progress']}" if e["progress"] else "",
                 f"from {e['started']}" if e["started"] else "", f"finished {e['finished']}" if e["finished"] else ""]
-        self.meta.setText(" · ".join(b for b in bits if b))
+        path = store.get_path(self.main.db, e["site"], e["key"])
+        self.meta.setText(" · ".join(b for b in bits if b) + (f"\n{path}" if path else ""))
         self.notes.setPlainText(e["notes"])
         if e["cover"]:
             url = e["cover"]
@@ -954,6 +971,52 @@ class Home(QWidget):
     def edit(self):
         if self.current:
             self.log_row(self.current)
+
+    def actions(self):
+        menu = self.action_menu()
+        if menu:
+            menu.exec(QCursor.pos())
+
+    def action_menu(self):
+        """The click menu: open what you have of it on disk, or say where it is."""
+        e = self.current
+        if not e:
+            return None
+        path = store.get_path(self.main.db, e["site"], e["key"])
+        here = bool(path) and os.path.exists(path)
+        steam = e["key"].removeprefix("steam:") if e["key"].startswith("steam:") else ""
+        menu = QMenu(self)
+        target = scan.main_file(path, e["kind"]) if here else None
+        if steam and not target:
+            menu.addAction("Play on Steam", lambda: QDesktopServices.openUrl(QUrl(f"steam://rungameid/{steam}")))
+        else:
+            menu.addAction("Open file", lambda: open_local(target)).setEnabled(bool(target))
+        menu.addAction("Open folder", lambda: open_local(path if os.path.isdir(path) else os.path.dirname(path))).setEnabled(here)
+        menu.addAction("Open screenshots folder", lambda: self.screenshots(path)).setEnabled(here)
+        menu.addSeparator()
+        where = menu.addMenu("Location" if path else "Set location")
+        where.addAction("Choose folder…", lambda: self.locate(QFileDialog.getExistingDirectory(self, "Where is it?", path or str(Path.home()))))
+        where.addAction("Choose file…", lambda: self.locate(QFileDialog.getOpenFileName(self, "Where is it?", path or str(Path.home()))[0]))
+        if path:
+            where.addAction("Forget location", lambda: self.locate(None))
+        menu.addSeparator()
+        menu.addAction("Edit…", self.edit)
+        menu.addAction("Open site", lambda: open_link(e["url"])).setEnabled(bool(e["url"]))
+        return menu
+
+    def locate(self, path):
+        if path is None or path:  # None: forget it. "": the file dialog was cancelled
+            store.set_path(self.main.db, self.current["site"], self.current["key"], path or "")
+            self.show_entry(self.current)
+
+    def screenshots(self, path):
+        shots = scan.screenshots_dir(path)
+        try:
+            os.makedirs(shots, exist_ok=True)
+        except OSError as err:
+            show_error(self, "Can't make the screenshots folder", err)
+            return
+        open_local(shots)
 
     def delete(self):
         if self.current and confirm(self, "Delete entry?", f"Remove “{self.current['title']}” from this log?", "Delete"):

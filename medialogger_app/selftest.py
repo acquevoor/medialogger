@@ -52,7 +52,10 @@ def test_store(tmp):
     # export -> import round trip, name collision gets a suffix, source untouched
     st.set_setting(db, "anilist", "me")
     path = tmp / "out" / "me.json"
+    st.set_path(db, "anilist", "154587", "/somewhere/Frieren")
+    assert st.get_path(db, "anilist", "154587") == "/somewhere/Frieren"
     st.export_profile(db, "main", path)
+    assert "/somewhere" not in Path(path).read_text(encoding="utf-8"), "locations are local: never in an exported profile"
     assert os.name == "nt" or path.stat().st_mode & 0o777 == 0o600  # Windows has no such modes
     name = st.import_new(st.read_profile(path) | {"name": "main"})
     assert name == "main (2)" and st.list_profiles() == ["main", "main (2)"]
@@ -468,7 +471,7 @@ def test_scan(tmp):
     (lib2 / "steamapps").mkdir(parents=True)
     (root / "steamapps/libraryfolders.vdf").write_text(f'"libraryfolders"\n{{ "0" {{ "path" "{root}" }} "1" {{ "path" "{lib2}" }} }}')
     for lib, appid, name in ((root, 1145360, "Hades"), (root, 1493710, "Proton Experimental"), (lib2, 4000, "Garry's Mod"), (lib2, 5, "Unplayed")):
-        (lib / f"steamapps/appmanifest_{appid}.acf").write_text(f'"AppState" {{ "appid" "{appid}" "name" "{name}" }}')
+        (lib / f"steamapps/appmanifest_{appid}.acf").write_text(f'"AppState" {{ "appid" "{appid}" "name" "{name}" "installdir" "{name}" }}')
     conf = root / "userdata/1/config"
     conf.mkdir(parents=True)
     now = 1_800_000_000
@@ -480,7 +483,9 @@ def test_scan(tmp):
     def lookup(ids):
         asked.append(set(ids))
         return {"777": {"name": "Played Then Removed", "type": 0, "content_descriptorids": [1, 5]}, "778": {"name": "A Soundtrack", "type": 6}}
-    got = {r["match"]["key"]: r["match"] for r in scan.scan_steam([root], lookup, now)}
+    found = {r["match"]["key"]: r for r in scan.scan_steam([root], lookup, now)}
+    assert found["steam:4000"]["path"] == str(lib2 / "steamapps/common/Garry's Mod") and "path" not in found["steam:777"]  # uninstalled: nowhere
+    got = {k: r["match"] for k, r in found.items()}
     assert set(got) == {"steam:1145360", "steam:4000", "steam:5", "steam:777"}, got.keys()
     assert [got[k]["status"] for k in ("steam:1145360", "steam:4000", "steam:5", "steam:777")] == ["active", "done", "planned", "done"]
     assert got["steam:1145360"]["detail"] == "10 h played" and got["steam:5"]["detail"] == "installed" and got["steam:777"]["nsfw"] and not got["steam:4000"]["nsfw"]
@@ -493,13 +498,14 @@ def test_scan(tmp):
                            ("b", {"name": "[SubsPlease] Frieren - 02 (1080p).mkv", "length": 9}, {}),
                            ("c", {"name": "Radiohead - OK Computer (1997) [FLAC]", "files": [{"path": ["01.flac"], "length": 9}, {"path": ["cover.jpg"], "length": 1}]}, {}),
                            ("d", {"name": "Some Thing", "files": [{"path": ["x.mkv"], "length": 9}]}, {"qBt-category": "Movies"})):
-        (bt / f"{h}.fastresume").write_bytes(bencode({"qBt-name": "", **extra}))
+        (bt / f"{h}.fastresume").write_bytes(bencode({"qBt-name": "", "qBt-savePath": "/dl", **extra}))
         (bt / f"{h}.torrent").write_bytes(bencode({"info": info}))
     (bt / "e.fastresume").write_bytes(b"d4:name")
     rows = {r["title"]: r for r in scan.scan_qbittorrent([bt])}
     assert set(rows) == {"Frieren", "OK Computer", "Some Thing"}, rows.keys()
     assert rows["Frieren"]["kind"] == "anime" and rows["Frieren"]["count"] == 2 and rows["Frieren"]["done"]
     assert rows["OK Computer"]["kind"] == "music" and rows["OK Computer"]["creator"] == "Radiohead" and rows["Some Thing"]["kind"] == "film"
+    assert rows["Some Thing"]["path"] == os.path.join("/dl", "Some Thing")
     rejected(lambda: scan.bdecode(b"5:ab"), "bad string")
 
     # a folder: one work per top-level entry; hidden and media-less entries skipped
@@ -511,7 +517,23 @@ def test_scan(tmp):
     (media / "Docs").mkdir()
     (media / "Docs/a.doc").write_bytes(b"x")
     (media / "Overlord v01-16.epub").write_bytes(b"x")
-    assert [(r["title"], r["kind"], r["year"]) for r in scan.scan_folder(media)] == [("Heat", "film", 1995), ("Overlord", "novel", None)]
+    assert [(r["title"], r["kind"], r["year"], r["path"]) for r in scan.scan_folder(media)] == [("Heat", "film", 1995, str(media / "Heat (1995)")),
+                                                                                              ("Overlord", "novel", None, str(media / "Overlord v01-16.epub"))]
+
+    # what "Open file" opens: the file itself; a series' first episode, never the sample; a game's program, not its uninstaller
+    show = media / "Show"
+    (show / "extras").mkdir(parents=True)
+    for name, size in (("Show - 02.mkv", 900), ("Show - 01.mkv", 900), ("extras/sample.mkv", 950), ("extras/NCOP.mkv", 950), ("tiny.mkv", 10)):
+        (show / name).write_bytes(b"x" * size)
+    assert scan.main_file(str(show), "anime") == str(show / "Show - 01.mkv")
+    game = media / "Game"
+    game.mkdir()
+    for name, size in (("Game.exe", 500), ("unins000.exe", 900), ("UnityCrashHandler64.exe", 800), ("data.pak", 9000)):
+        (game / name).write_bytes(b"x" * size)
+    assert scan.main_file(str(game), "game") == str(game / "Game.exe")
+    epub = str(media / "Overlord v01-16.epub")
+    assert scan.main_file(epub, "novel") == epub and scan.main_file(str(media / "Docs"), "film") is None
+    assert scan.screenshots_dir(str(game)) == str(game / "Screenshots") and scan.screenshots_dir(epub) == str(media / "Overlord v01-16 - Screenshots")
 
 
 def test_launcher(tmp):

@@ -34,6 +34,7 @@ create table if not exists entries(
   notes text not null default '', nsfw integer not null default 0, edited integer not null default 0, created integer not null, updated integer not null,
   unique(site, key));
 create table if not exists settings(k text primary key, v text not null);
+create table if not exists paths(site text not null, key text not null, path text not null, primary key(site, key));
 """
 
 
@@ -235,6 +236,21 @@ def save_entry(db, row):
                        [r[f] for f in SITE_FIELDS] + [now, old["id"]])
         else:
             _insert(db, r)
+
+
+def get_path(db, site, key):
+    """Where this work is on disk. Kept apart from entries on purpose: never exported, imported or synced, so a
+    profile file from elsewhere can't point "Open file" at a program."""
+    row = db.execute("select path from paths where site=? and key=?", (site, key)).fetchone()
+    return row["path"] if row else ""
+
+
+def set_path(db, site, key, path):
+    with db:
+        if path:
+            db.execute("insert into paths values(?,?,?) on conflict(site, key) do update set path=excluded.path", (site, key, path))
+        else:
+            db.execute("delete from paths where site=? and key=?", (site, key))
 
 
 def delete_entry(db, entry_id):

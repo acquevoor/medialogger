@@ -50,6 +50,18 @@ To log something, type in the search box and press Enter. With several kinds sho
 - **Letterboxd export:** Settings → Data → Export your data. Import the zip as is.
 - **RateYourMusic export:** your profile page → Export your data. Save it as a `.csv`.
 
+## Opening what you have
+
+Click a cover in Grid view (or right-click a row in List view) for a menu:
+
+- **Open file:** the work itself. For a folder, its main file: a game's program (not the uninstaller), a series' first episode (not the sample).
+- **Open folder:** where it is.
+- **Open screenshots folder:** a `Screenshots` folder inside the work's folder, made the first time you open it (next to a single file it's `<name> - Screenshots`).
+- **Play on Steam:** Steam games open through Steam when no file is set.
+- **Set location:** point an entry at its folder or file by hand.
+
+**Scan for media** remembers where everything it finds is, including when you add entries that are already in your log, so scanning again is how older entries get a location. Locations stay on this computer: they're never in an exported profile, so a profile file from someone else can't make **Open file** run anything.
+
 ## Grid creator
 
 The **Grid creator** tab makes a chart of square covers from your log, up to 20×20. Set the columns and rows, then double-click entries in the list on the left to fill the cells in order, or drag one onto a cell. Drag a cell onto another to swap them; right-click or Delete empties one. **Names on the right** lists each row's names beside it. **Export image…** saves a PNG at the cell size you pick (300 px makes a 3×3 grid 900 px square). Adult covers stay blurred in the export unless **Show adult covers** is ticked. The grid is kept per profile.
