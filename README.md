@@ -99,7 +99,7 @@ The first start makes the app's own Python environment in `~/.local/share/medial
 
 ## Updates
 Every copy updates itself when it starts, so there's nothing to re-download:
-- A `git clone` runs `git pull`.
+- A `git clone` runs `git pull`, on Windows and Linux alike. A clone on a PC without git installed (made with GitHub Desktop, say) updates by download like the ZIP.
 - The ZIP and the Nix package download the latest `medialogger_app/` from this repository's `master` into `~/.local/share/medialogger/code/` and run it from there.
 
 If you're offline, or an update is broken, the app starts with the version it has. This runs code from this repository on your machine each time it changes.

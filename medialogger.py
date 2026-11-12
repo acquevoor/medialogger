@@ -106,12 +106,17 @@ def install(data, sha, code):
         shutil.rmtree(os.path.join(code, old), ignore_errors=True)
 
 
+def pulls(folder):
+    """A git clone with git to pull it. A clone on a PC without git (GitHub Desktop, a copied folder) updates by download instead."""
+    return os.path.exists(os.path.join(folder, ".git")) and shutil.which("git")
+
+
 def update(folder=HERE, code=CODE):
     """Never stops the app: offline, no git, local edits in the way or a bad download just means it starts as it is.
     A clone pulls. A ZIP and the Nix package have no .git (and the Nix one is read-only), so the
     latest medialogger_app/ goes in CODE, which is run instead of the copy next to this file."""
     try:
-        if os.path.exists(os.path.join(folder, ".git")):
+        if pulls(folder):
             r = subprocess.run(["git", "-C", folder, "pull", "--ff-only", "--quiet"], capture_output=True, text=True, timeout=15,
                                env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
             print("Not updated:", r.stderr.strip()) if r.returncode else print("Up to date")
@@ -130,7 +135,7 @@ def update(folder=HERE, code=CODE):
 
 def load():
     """The app's main(). If the downloaded code won't load, the copy next to this file still does."""
-    folder = None if os.path.exists(os.path.join(HERE, ".git")) else current(CODE)
+    folder = None if pulls(HERE) else current(CODE)
     if folder and sys.argv[1:] in ([], ["--update"]):
         sys.path.insert(0, folder)
         try:

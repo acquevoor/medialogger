@@ -517,6 +517,15 @@ def test_launcher(tmp):
     served["sha"] = "<html>"
     launcher.update(str(plain), code)
     assert launcher.current(code) == str(Path(code, sha3))
+    nogit = tmp / "nogit"
+    (nogit / ".git").mkdir(parents=True)  # a clone, but no git on PATH: it updates by download like a ZIP
+    which, launcher.shutil.which = launcher.shutil.which, lambda _: None
+    served.update(sha=sha1, zip=fake_zip(**{"r/medialogger_app/ui.py": "main = 4"}))
+    try:
+        launcher.update(str(nogit), code)
+    finally:
+        launcher.shutil.which = which
+    assert launcher.current(code) == str(Path(code, sha1))
 
 
 def selftest():
